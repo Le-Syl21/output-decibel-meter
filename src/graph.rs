@@ -27,7 +27,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use pipewire as pw;
 use pw::metadata::{Metadata, MetadataListener};
-use pw::node::{Node, NodeListener};
+use pw::node::{Node, NodeChangeMask, NodeListener};
 use pw::properties::properties;
 use pw::spa;
 use spa::param::audio::{AudioFormat, AudioInfoRaw};
@@ -324,7 +324,9 @@ fn follow(
                 let id = global.id;
                 let entry = Found {
                     node_name: props.get("node.name").unwrap_or_default().to_string(),
-                    name: name_of(props, kind),
+                    // A placeholder only until the node describes itself, which
+                    // is where the readable name comes from.
+                    name: name_of(props, kind).unwrap_or_else(|| unnamed(kind).to_string()),
                     serial: serial.to_string(),
                     kind,
                     // Only the node itself says so; the registry does not.
@@ -332,8 +334,23 @@ fn follow(
                 };
 
                 // What the registry already knows, in case the node itself
-                // never answers: a listed node beats a missing one.
-                found.borrow_mut().insert(id, entry.clone());
+                // never answers: a listed node beats a missing one. A node
+                // announced again keeps the name it has — the registry carries
+                // fewer properties than the node itself, so overwriting could
+                // only ever lose the readable one.
+                {
+                    let mut found = found.borrow_mut();
+                    match found.get_mut(&id) {
+                        Some(known) => {
+                            if let Some(name) = name_of(props, kind) {
+                                known.name = name;
+                            }
+                        }
+                        None => {
+                            found.insert(id, entry.clone());
+                        }
+                    }
+                }
                 publish();
 
                 let Ok(node) = registry.bind::<Node, _>(global) else {
@@ -345,22 +362,28 @@ fn follow(
                         let found = Rc::clone(&found);
                         let publish = Rc::clone(&publish);
                         move |info| {
-                            let Some(props) = info.props() else { return };
-                            found.borrow_mut().insert(
-                                id,
-                                Found {
-                                    node_name: props
-                                        .get("node.name")
-                                        .unwrap_or(&entry.node_name)
-                                        .to_string(),
-                                    name: name_of(props, kind),
-                                    is_running: matches!(
-                                        info.state(),
-                                        pw::node::NodeState::Running
-                                    ),
-                                    ..entry.clone()
-                                },
-                            );
+                            {
+                                let mut found = found.borrow_mut();
+                                let Some(known) = found.get_mut(&id) else {
+                                    return;
+                                };
+                                known.is_running =
+                                    matches!(info.state(), pw::node::NodeState::Running);
+                                // An event that only reports a state change
+                                // carries no properties. Reading them anyway
+                                // would rename every node "unnamed" the first
+                                // time it started or stopped playing.
+                                if info.change_mask().contains(NodeChangeMask::PROPS)
+                                    && let Some(props) = info.props()
+                                {
+                                    if let Some(name) = name_of(props, kind) {
+                                        known.name = name;
+                                    }
+                                    if let Some(node_name) = props.get("node.name") {
+                                        known.node_name = node_name.to_string();
+                                    }
+                                }
+                            }
                             publish();
                         }
                     })
@@ -696,28 +719,24 @@ fn run(
     Ok(())
 }
 
-/// A readable name for a node.
+/// A readable name for a node, or `None` when nothing in these properties names
+/// it — which happens on events that report something else entirely.
 ///
 /// A device says what it is in `node.description` — "Analog Stereo", the string
 /// the system settings show. A program is worth naming by both halves, since
 /// "Firefox" alone does not say which tab and a track title alone does not say
 /// which program, but only when they differ.
-fn name_of(props: &DictRef, kind: Kind) -> String {
-    let described = || {
-        props
+fn name_of(props: &DictRef, kind: Kind) -> Option<String> {
+    let name = match kind {
+        Kind::Sink | Kind::Source => props
             .get("node.description")
             .or_else(|| props.get("node.nick"))
-            .or_else(|| props.get("node.name"))
-            .unwrap_or("unnamed device")
-            .to_string()
-    };
-    let name = match kind {
-        Kind::Sink | Kind::Source => described(),
+            .or_else(|| props.get("node.name"))?
+            .to_string(),
         Kind::Program => {
             let application = props
                 .get("application.name")
-                .or_else(|| props.get("node.name"))
-                .unwrap_or("unnamed program");
+                .or_else(|| props.get("node.name"))?;
             match props.get("media.name") {
                 Some(media) if !media.is_empty() && media != application => {
                     format!("{application} — {media}")
@@ -726,7 +745,15 @@ fn name_of(props: &DictRef, kind: Kind) -> String {
             }
         }
     };
-    shorten(&name)
+    (!name.is_empty()).then(|| shorten(&name))
+}
+
+/// What to show until a node has said what it is called.
+fn unnamed(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Sink | Kind::Source => "unnamed device",
+        Kind::Program => "unnamed program",
+    }
 }
 
 /// Cut a name to [`NAME_LIMIT`] characters, marking that it was cut.
@@ -741,6 +768,92 @@ fn shorten(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node as the collector would hold it.
+    fn node(kind: Kind, is_running: bool) -> Found {
+        Found {
+            node_name: "node".to_string(),
+            name: "Something".to_string(),
+            serial: "1".to_string(),
+            kind,
+            is_running,
+        }
+    }
+
+    /// Run the activity rules over a graph given as (nodes, links, recorders).
+    fn activity(
+        nodes: &[(u32, Found)],
+        links: &[(u32, u32)],
+        recorders: &[(u32, bool)],
+    ) -> Vec<bool> {
+        let found: HashMap<u32, Found> = nodes.iter().cloned().collect();
+        let links: HashMap<u32, (u32, u32)> = links
+            .iter()
+            .enumerate()
+            .map(|(i, ends)| (1000 + i as u32, *ends))
+            .collect();
+        let recorders: HashMap<u32, Recorder> = recorders
+            .iter()
+            .map(|(id, is_ours)| (*id, Recorder { is_ours: *is_ours }))
+            .collect();
+
+        let snapshot = snapshot(&found, &Defaults::default(), &links, &recorders);
+        nodes
+            .iter()
+            .map(|(_, f)| {
+                snapshot
+                    .iter()
+                    .find(|n| n.serial == f.serial && n.kind == f.kind)
+                    .is_some_and(|n| n.is_active)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn metering_an_output_does_not_make_it_active() {
+        // The whole point: this meter links itself to the sink's monitor, which
+        // starts the node turning. Nothing is playing, so nothing is active.
+        let sink = node(Kind::Sink, true);
+        assert_eq!(activity(&[(1, sink)], &[(1, 2)], &[(2, true)]), [false]);
+    }
+
+    #[test]
+    fn an_output_a_program_plays_into_is_active() {
+        let program = Found {
+            serial: "2".to_string(),
+            ..node(Kind::Program, true)
+        };
+        let sink = node(Kind::Sink, true);
+        assert_eq!(
+            activity(&[(1, sink), (2, program)], &[(2, 1)], &[]),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn a_paused_program_lights_nothing() {
+        // A tab on pause keeps its node linked to the output, corked.
+        let program = Found {
+            serial: "2".to_string(),
+            ..node(Kind::Program, false)
+        };
+        let sink = node(Kind::Sink, true);
+        assert_eq!(
+            activity(&[(1, sink), (2, program)], &[(2, 1)], &[]),
+            [false, false]
+        );
+    }
+
+    #[test]
+    fn an_input_is_active_only_for_someone_else() {
+        let source = node(Kind::Source, true);
+        assert_eq!(
+            activity(&[(1, source.clone())], &[(1, 2)], &[(2, true)]),
+            [false],
+            "this meter recording it is not the input being in use"
+        );
+        assert_eq!(activity(&[(1, source)], &[(1, 2)], &[(2, false)]), [true]);
+    }
 
     #[test]
     fn a_short_name_is_left_alone() {

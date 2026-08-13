@@ -6,12 +6,15 @@
 //!
 //! Two capture modes, because they are not equivalent:
 //!
-//! - **device**, a loopback of an output. Simple, available everywhere through
-//!   `cpal`, but the point of measurement differs per platform: on Linux it
-//!   sits *after* the system volume, on Windows and macOS *before* it.
-//! - **application**, tapping one program's stream. The same point of
-//!   measurement on all three platforms, upstream of any device volume, which
-//!   makes readings comparable between machines.
+//! - **device**, a loopback of an output: everything the machine plays, mixed.
+//!   Available everywhere, but the point of measurement differs per platform,
+//!   and on Linux it depends on how that machine applies its volume.
+//! - **application**, tapping one program's stream. Upstream of any device
+//!   volume, which makes readings comparable between machines.
+//!
+//! On Linux both go through PipeWire, where what plays is a node in a graph and
+//! a meter is a node linked to it. On Windows and macOS, `cpal` provides device
+//! loopback and no program can be tapped yet.
 //!
 //! Everything is reported on two scales, both referenced to digital full scale
 //! and therefore negative: **LUFS** for perceived loudness, gated as EBU R128
@@ -19,6 +22,8 @@
 //! clips.
 
 pub mod capture;
+#[cfg(all(target_os = "linux", feature = "pipewire"))]
+pub mod graph;
 pub mod meter;
 
 pub use capture::{CaptureMode, Source, sources};

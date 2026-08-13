@@ -31,15 +31,7 @@ fn main() -> Result<()> {
 
     if cli.list {
         for source in capture::sources()? {
-            println!(
-                "  {} {}",
-                if source.is_output {
-                    "[output]"
-                } else {
-                    "[input] "
-                },
-                source.name
-            );
+            println!("  {} {}", tag(&source), source.name);
         }
         return Ok(());
     }
@@ -87,6 +79,15 @@ fn main() -> Result<()> {
     println!("  integrated  {:>8.1} LUFS", last.integrated);
     println!("  true peak   {:>8.1} dBTP", last.true_peak);
     Ok(())
+}
+
+/// What kind of source this is, in a column of its own so the list lines up.
+fn tag(source: &Source) -> &'static str {
+    match (source.mode, source.is_output) {
+        (CaptureMode::Application, _) => "[app]   ",
+        (CaptureMode::Device, true) => "[output]",
+        (CaptureMode::Device, false) => "[input] ",
+    }
 }
 
 /// Say what is being measured and where the tap sits.

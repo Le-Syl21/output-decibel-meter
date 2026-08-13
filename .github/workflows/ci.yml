@@ -42,11 +42,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
-      # ALSA for cpal, GTK for the file dialogs eframe pulls in.
+      # ALSA for cpal, GTK for the file dialogs eframe pulls in, PipeWire for
+      # per-program capture — with clang, which its bindings generate through.
       - name: Install audio and GUI dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libgtk-3-dev libglib2.0-dev
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libglib2.0-dev \
+                                  libpipewire-0.3-dev libclang-dev
 
       - name: Check formatting
         run: cargo fmt --check
@@ -56,6 +58,11 @@ jobs:
 
       - name: Clippy (GUI)
         run: cargo clippy --release --features gui --all-targets -- -D warnings
+
+      # The way out for a machine without PipeWire headers. It compiles a
+      # different set of modules, so it is worth a gate of its own.
+      - name: Clippy (device capture alone)
+        run: cargo clippy --release --no-default-features --all-targets -- -D warnings
 
   build:
     needs: lint
@@ -98,7 +105,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libgtk-3-dev libglib2.0-dev
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libglib2.0-dev \
+                                  libpipewire-0.3-dev libclang-dev
 
       - name: Build CLI
         run: cargo build --release --target ${{ matrix.target }}

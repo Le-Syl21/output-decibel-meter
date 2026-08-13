@@ -2,8 +2,9 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Vec2};
 use output_decibel_meter::capture::{self, CaptureMode};
@@ -19,6 +20,13 @@ const PEAK_FALL_DB_PER_S: f32 = 12.0;
 
 /// Points kept in the graph — about a minute at one point per 100 ms.
 const HISTORY: usize = 600;
+
+/// How often the source list is taken again.
+///
+/// Programs come and go while the window stays open, and a list frozen at
+/// startup would never show the one just started. Taken on a thread, because
+/// enumerating devices can take long enough to be seen as a stutter.
+const RELIST_EVERY: Duration = Duration::from_secs(2);
 
 /// What the capture thread publishes and the window reads.
 #[derive(Default)]
@@ -40,8 +48,8 @@ struct Worker {
 }
 
 impl Worker {
-    /// Start metering a source by name.
-    fn start(source_name: String) -> Self {
+    /// Start metering the source this key designates.
+    fn start(source_key: String) -> Self {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let reset = Arc::new(AtomicBool::new(false));
@@ -54,7 +62,7 @@ impl Worker {
         // and kept on this thread; only the readings cross over.
         std::thread::spawn(move || {
             let result = (|| -> anyhow::Result<()> {
-                let source = capture::find(&source_name)?;
+                let source = capture::by_key(&source_key)?;
                 let capture = source.open()?;
                 let mut meter = Meter::new(capture.channels, capture.sample_rate)?;
                 thread_shared.lock().unwrap().format =
@@ -108,28 +116,64 @@ impl Drop for Worker {
     }
 }
 
+/// One line of the source list, as the window needs it.
+///
+/// A copy rather than a `Source`, because the list is taken on another thread
+/// and only strings cross over.
+#[derive(Clone, PartialEq)]
+struct Row {
+    name: String,
+    mode: CaptureMode,
+    is_output: bool,
+    /// What reopens this exact source later, names being ambiguous.
+    key: String,
+}
+
+fn rows() -> Vec<Row> {
+    capture::sources()
+        .map(|list| {
+            list.into_iter()
+                .map(|s| Row {
+                    key: s.key(),
+                    name: s.name,
+                    mode: s.mode,
+                    is_output: s.is_output,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 struct MeterApp {
-    sources: Vec<(String, CaptureMode, bool)>,
-    selected: usize,
+    sources: Vec<Row>,
+    /// The source being metered, kept whole: it may leave the list while it is
+    /// still what the window is showing.
+    selected: Option<Row>,
     worker: Option<Worker>,
     /// Falling peak marker, in dB.
     peak_marker: f32,
+    /// A list being taken on another thread, if one is.
+    relisting: Option<Receiver<Vec<Row>>>,
+    last_relist: Instant,
 }
 
 impl MeterApp {
     fn new() -> Self {
-        let sources = capture::sources()
-            .map(|list| {
-                list.into_iter()
-                    .map(|s| (s.name, s.mode, s.is_output))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let sources = rows();
+        // Start on the system output rather than on whatever heads the list:
+        // cpal opens with JACK and the sound servers, which are rarely what a
+        // window opened to watch the speakers should be metering.
+        let default = capture::default_output().ok().map(|s| s.key());
+        let selected = default
+            .and_then(|key| sources.iter().find(|r| r.key == key).cloned())
+            .or_else(|| sources.first().cloned());
         let mut app = Self {
+            selected,
             sources,
-            selected: 0,
             worker: None,
             peak_marker: FLOOR_DB,
+            relisting: None,
+            last_relist: Instant::now(),
         };
         app.restart();
         app
@@ -139,8 +183,39 @@ impl MeterApp {
     fn restart(&mut self) {
         self.worker = None;
         self.peak_marker = FLOOR_DB;
-        if let Some((name, _, _)) = self.sources.get(self.selected) {
-            self.worker = Some(Worker::start(name.clone()));
+        if let Some(row) = &self.selected {
+            self.worker = Some(Worker::start(row.key.clone()));
+        }
+    }
+
+    /// Take the source list again, off the painting thread.
+    fn relist(&mut self) {
+        match &self.relisting {
+            Some(pending) => match pending.try_recv() {
+                Ok(sources) => {
+                    self.sources = sources;
+                    self.relisting = None;
+                    self.last_relist = Instant::now();
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.relisting = None,
+            },
+            None if self.last_relist.elapsed() >= RELIST_EVERY => {
+                let (tx, rx) = channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(rows());
+                });
+                self.relisting = Some(rx);
+            }
+            None => {}
+        }
+    }
+
+    /// True when the metered source has left the list — a program that stopped.
+    fn selection_is_gone(&self) -> bool {
+        match &self.selected {
+            Some(row) => !self.sources.iter().any(|s| s.key == row.key),
+            None => false,
         }
     }
 }
@@ -190,36 +265,43 @@ impl eframe::App for MeterApp {
             self.peak_marker = reading.recent_peak as f32;
         }
 
+        // The list is a snapshot of what is playing, so it is taken again while
+        // the window is open, and the id salt follows its length: an egui popup
+        // keeps the size it was first shown at.
+        self.relist();
+        let stopped = self.selection_is_gone();
+
         egui::Panel::top("source").show(root, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let label = self
-                    .sources
-                    .get(self.selected)
-                    .map(|(n, _, _)| n.clone())
-                    .unwrap_or_else(|| "no source".to_string());
+                let label = match &self.selected {
+                    Some(row) if stopped => format!("{} — stopped", row.name),
+                    Some(row) => row.name.clone(),
+                    None => "no source".to_string(),
+                };
 
                 let mut changed = None;
-                egui::ComboBox::from_id_salt("source")
+                egui::ComboBox::from_id_salt(("source", self.sources.len()))
                     .selected_text(label)
                     .width(360.0)
                     .show_ui(ui, |ui| {
-                        for (index, (name, mode, is_output)) in self.sources.iter().enumerate() {
-                            let tag = match (mode, is_output) {
+                        for row in &self.sources {
+                            let tag = match (row.mode, row.is_output) {
                                 (CaptureMode::Application, _) => "app",
                                 (CaptureMode::Device, true) => "out",
                                 (CaptureMode::Device, false) => "in ",
                             };
+                            let chosen = self.selected.as_ref().is_some_and(|s| s.key == row.key);
                             if ui
-                                .selectable_label(index == self.selected, format!("[{tag}] {name}"))
+                                .selectable_label(chosen, format!("[{tag}] {}", row.name))
                                 .clicked()
                             {
-                                changed = Some(index);
+                                changed = Some(row.clone());
                             }
                         }
                     });
-                if let Some(index) = changed {
-                    self.selected = index;
+                if let Some(row) = changed {
+                    self.selected = Some(row);
                     self.restart();
                 }
 
@@ -233,8 +315,8 @@ impl eframe::App for MeterApp {
 
             // Where the tap sits changes what the numbers mean, so it is said
             // on screen rather than buried in a manual.
-            if let Some((_, mode, _)) = self.sources.get(self.selected) {
-                let note = match mode.includes_system_volume() {
+            if let Some(row) = &self.selected {
+                let note = match row.mode.includes_system_volume() {
                     Some(true) => "system volume included",
                     Some(false) => "measured before the system volume",
                     None => "system volume may be included on this machine",

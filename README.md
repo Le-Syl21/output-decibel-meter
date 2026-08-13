@@ -37,13 +37,20 @@ point it was taken at, and that point is not the same everywhere.
 |---|---|---|---|
 | device | Windows | WASAPI loopback of the render mix | no |
 | device | macOS | Core Audio process tap | no |
-| device | Linux | monitor of a sink | **depends on the setup** |
-| application | all three | the program's own stream | no |
+| device | Linux | the monitor ports of a sink | **depends on the setup** |
+| application | Linux | the program's own output ports | no |
+
+"Depends on the setup" is meant literally: a sink's monitor carries the system
+volume when the volume is applied in software, and does not when the card
+applies it. This machine, PipeWire on an HDA codec, does not — the tone reads
+−20.0 dBTP at 10 % volume as at 34 %. Another machine may differ, which is
+exactly why the tools say `depends` rather than picking an answer.
 
 Device capture is the simple one and it is enough to compare before and after
 on a single machine. Application capture is the one whose readings can be
-compared **between** machines, because the tap sits at the same place on all
-three platforms, upstream of any device volume.
+compared **between** machines, because the tap sits upstream of any device
+volume — the same audio the program wrote, whatever the speakers do with it
+afterwards.
 
 The tools print which of these applies on every run rather than leaving it to
 be guessed.
@@ -59,6 +66,9 @@ output-decibel-meter
 
 # a named source, for thirty seconds
 output-decibel-meter --source "HyperX" --seconds 30
+
+# one program rather than the whole machine — any part of its name will do
+output-decibel-meter --source "Firefox"
 ```
 
 ```
@@ -96,15 +106,28 @@ while let Some(block) = capture.next_block(Duration::from_millis(200)) {
 # Ok::<(), anyhow::Error>(())
 ```
 
-The library pulls in `cpal` and `ebur128` and nothing else; `egui` only arrives
-with the `gui` feature.
+The library pulls in `cpal` and `ebur128`, plus `pipewire` on Linux; `egui` only
+arrives with the `gui` feature.
 
 ## Status
 
-Device capture works on the three platforms. Application capture is
-**not implemented yet** — the mechanisms exist on all three (PipeWire port
-links, WASAPI process loopback, Core Audio process taps) and Linux comes first.
-Until then the mode is declared and refused rather than silently absent.
+On Linux both modes work, and both go through PipeWire: what plays is a node in
+one graph, and the meter is a node linked either to a sink's monitor ports or to
+a program's own output ports. Against a −20 dBFS reference tone, both read
+−20.0 LUFS and −20.0 dBTP; the program tap stays there with the system volume
+pulled down to 5 %, which is the property that mode exists for.
+
+The graph is also what gets listed, and that is not a detail. Asked through ALSA
+for the default output opened for capture, the machine hands over the default
+*input* — the meter reads the microphone and reports −65 LUFS while the speakers
+play a −20 dBFS tone. Nothing in the numbers says so. Going through the graph
+removes the ambiguity, and incidentally lists each device once instead of once
+per access path.
+
+Windows and macOS use device loopback through `cpal`, which is right there, and
+list no programs yet. The mechanisms exist — WASAPI process loopback, Core Audio
+process taps — and the shape of the code is ready for them: something lists,
+something taps, everything above works on blocks of `f32`.
 
 ## Building
 
@@ -113,4 +136,7 @@ cargo build --release                 # library + CLI
 cargo build --release --features gui  # and the meter window
 ```
 
-Linux needs `libasound2-dev`, plus `libgtk-3-dev` for the GUI.
+Linux needs `libasound2-dev`, plus `libgtk-3-dev` for the GUI. The PipeWire
+backend is on by default, so it also needs `libpipewire-0.3-dev` and `clang`;
+`--no-default-features` drops both, and with them per-program capture and the
+graph listing, leaving device capture through ALSA.

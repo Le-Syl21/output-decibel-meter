@@ -16,9 +16,11 @@
 //! The work happens on its own thread: PipeWire wants a loop of its own and
 //! none of its objects cross threads, so only the samples do, over a channel.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -40,6 +42,10 @@ use spa::utils::{Direction, SpaTypes};
 /// Reached only when the target vanished between listing and opening, or when
 /// nothing can be linked; a live target answers in milliseconds.
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What this meter calls its own capture node, so its taps can be told apart
+/// from anyone else's when deciding whether a source is in use.
+const METER_NODE_NAME: &str = "output-decibel-meter";
 
 /// Longest name kept, in characters.
 ///
@@ -70,9 +76,14 @@ pub struct GraphNode {
     pub kind: Kind,
     /// True for the sink or the source the system currently defaults to.
     pub is_default: bool,
-    /// True while the node is actually passing audio, as opposed to sitting
-    /// idle with nothing playing through it.
-    pub is_running: bool,
+    /// True while a program is playing into it, taking from it, or — for a
+    /// program — playing into an output.
+    ///
+    /// Deliberately not PipeWire's own `running` state, which says the node
+    /// turns in the graph: metering an output starts it turning, so the state
+    /// would answer "running" to the very act of looking at it. What is asked
+    /// here is whether audio flows through it *besides* this meter.
+    pub is_active: bool,
 }
 
 /// What the capture thread needs to answer a `stop` and be waited on.
@@ -107,12 +118,79 @@ pub struct Tapped {
 /// The one message the capture thread accepts: stop.
 struct Terminate;
 
-/// Everything the graph offers to a meter: outputs, programs, then inputs.
+/// A live view of the graph, kept up to date by the server's own events.
 ///
-/// A program appears once per stream it opened, which is deliberate: a browser
-/// playing two tabs, or a table playing music apart from its effects, is two
-/// streams, and they are metered apart.
+/// Nothing is polled: PipeWire announces a node the moment it appears and again
+/// when it changes, so a program that starts playing shows up as it starts.
+/// Dropping the watch closes the connection.
+pub struct Watch {
+    seen: Arc<Mutex<Vec<GraphNode>>>,
+    quit: Option<pw::channel::Sender<Terminate>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Watch {
+    /// The graph as it stands: outputs, then programs, then inputs.
+    ///
+    /// A program appears once per stream it opened, which is deliberate: a
+    /// browser playing two tabs, or a table playing music apart from its
+    /// effects, is two streams, and they are metered apart.
+    pub fn nodes(&self) -> Vec<GraphNode> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        if let Some(quit) = self.quit.take() {
+            let _ = quit.send(Terminate);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Start watching the graph, returning once it has been read in full.
+pub fn watch() -> Result<Watch> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (ready_tx, ready_rx) = sync_channel::<Result<(), String>>(1);
+    let (quit_tx, quit_rx) = pw::channel::channel::<Terminate>();
+
+    let thread_seen = Arc::clone(&seen);
+    let failure = ready_tx.clone();
+    let thread = std::thread::Builder::new()
+        .name("odm-graph".to_string())
+        .spawn(move || {
+            if let Err(e) = follow(thread_seen, ready_tx, quit_rx) {
+                let _ = failure.try_send(Err(format!("{e:#}")));
+            }
+        })?;
+
+    let watch = Watch {
+        seen,
+        quit: Some(quit_tx),
+        thread: Some(thread),
+    };
+
+    match ready_rx.recv_timeout(NEGOTIATION_TIMEOUT) {
+        Ok(Ok(())) => Ok(watch),
+        Ok(Err(e)) => Err(anyhow!(e)),
+        Err(_) => bail!("PipeWire did not answer within five seconds"),
+    }
+}
+
+/// The graph, read once. A watch that is dropped as soon as it has answered.
 pub fn nodes() -> Result<Vec<GraphNode>> {
+    Ok(watch()?.nodes())
+}
+
+/// The watching thread: listen, publish, and keep listening.
+fn follow(
+    seen: Arc<Mutex<Vec<GraphNode>>>,
+    ready: SyncSender<Result<(), String>>,
+    quit_rx: pw::channel::Receiver<Terminate>,
+) -> Result<()> {
     pw::init();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -120,13 +198,46 @@ pub fn nodes() -> Result<Vec<GraphNode>> {
     let core = context.connect_rc(None)?;
     let registry = core.get_registry_rc()?;
 
-    let found: Rc<RefCell<Vec<Found>>> = Rc::new(RefCell::new(Vec::new()));
+    let stopped = Rc::new(Cell::new(false));
+    let _quit = quit_rx.attach(mainloop.loop_(), {
+        let mainloop = mainloop.clone();
+        let stopped = Rc::clone(&stopped);
+        move |_| {
+            stopped.set(true);
+            mainloop.quit();
+        }
+    });
+
+    // Indexed by the global id, because that is what a removal names. The
+    // proxies and their listeners live here too: a bound node stops reporting
+    // the moment its proxy is dropped.
+    let found: Rc<RefCell<HashMap<u32, Found>>> = Rc::new(RefCell::new(HashMap::new()));
     let defaults: Rc<RefCell<Defaults>> = Rc::new(RefCell::new(Defaults::default()));
-    // The registry announces a node with a handful of properties; the rest,
-    // media.name among them, only comes from the node itself. Binding it asks
-    // for that, and both the proxy and its listener have to outlive the ask.
-    let bound: Rc<RefCell<Vec<(Node, NodeListener)>>> = Rc::new(RefCell::new(Vec::new()));
+    let bound: Rc<RefCell<HashMap<u32, (Node, NodeListener)>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    // Links say what is actually connected to what, which is the only honest
+    // answer to "is anything playing through this".
+    let links: Rc<RefCell<HashMap<u32, (u32, u32)>>> = Rc::new(RefCell::new(HashMap::new()));
+    let recorders: Rc<RefCell<HashMap<u32, Recorder>>> = Rc::new(RefCell::new(HashMap::new()));
     let watched: Rc<RefCell<Vec<(Metadata, MetadataListener)>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let publish = {
+        let seen = Arc::clone(&seen);
+        let found = Rc::clone(&found);
+        let defaults = Rc::clone(&defaults);
+        let links = Rc::clone(&links);
+        let recorders = Rc::clone(&recorders);
+        move || {
+            let nodes = snapshot(
+                &found.borrow(),
+                &defaults.borrow(),
+                &links.borrow(),
+                &recorders.borrow(),
+            );
+            *seen.lock().unwrap_or_else(|e| e.into_inner()) = nodes;
+        }
+    };
+    let publish = Rc::new(publish);
 
     let _registry_listener = registry
         .add_listener_local()
@@ -136,9 +247,24 @@ pub fn nodes() -> Result<Vec<GraphNode>> {
             let defaults = Rc::clone(&defaults);
             let bound = Rc::clone(&bound);
             let watched = Rc::clone(&watched);
+            let links = Rc::clone(&links);
+            let recorders = Rc::clone(&recorders);
+            let publish = Rc::clone(&publish);
             move |global| {
                 match global.type_ {
                     pw::types::ObjectType::Node => {}
+                    pw::types::ObjectType::Link => {
+                        let Some(props) = global.props else { return };
+                        let ends = (
+                            props.get("link.output.node").and_then(|n| n.parse().ok()),
+                            props.get("link.input.node").and_then(|n| n.parse().ok()),
+                        );
+                        if let (Some(out), Some(into)) = ends {
+                            links.borrow_mut().insert(global.id, (out, into));
+                            publish();
+                        }
+                        return;
+                    }
                     // Which sink and source the system defaults to is not a
                     // property of any node; it lives in this one metadata.
                     pw::types::ObjectType::Metadata => {
@@ -153,6 +279,7 @@ pub fn nodes() -> Result<Vec<GraphNode>> {
                             .add_listener_local()
                             .property({
                                 let defaults = Rc::clone(&defaults);
+                                let publish = Rc::clone(&publish);
                                 move |_subject, key, _type, value| {
                                     let Some(value) = value.and_then(named) else {
                                         return 0;
@@ -164,8 +291,9 @@ pub fn nodes() -> Result<Vec<GraphNode>> {
                                         Some("default.audio.source") => {
                                             defaults.borrow_mut().source = Some(value)
                                         }
-                                        _ => {}
+                                        _ => return 0,
                                     }
+                                    publish();
                                     0
                                 }
                             })
@@ -177,10 +305,23 @@ pub fn nodes() -> Result<Vec<GraphNode>> {
                 }
 
                 let Some(props) = global.props else { return };
+                // Recorders are not metering targets, but they say whether an
+                // input is in use — and one of them is this meter.
+                if props.get("media.class") == Some("Stream/Input/Audio") {
+                    recorders.borrow_mut().insert(
+                        global.id,
+                        Recorder {
+                            is_ours: props.get("node.name") == Some(METER_NODE_NAME),
+                        },
+                    );
+                    publish();
+                    return;
+                }
                 let Some(kind) = kind_of(props) else { return };
                 let Some(serial) = props.get("object.serial") else {
                     return;
                 };
+                let id = global.id;
                 let entry = Found {
                     node_name: props.get("node.name").unwrap_or_default().to_string(),
                     name: name_of(props, kind),
@@ -192,7 +333,8 @@ pub fn nodes() -> Result<Vec<GraphNode>> {
 
                 // What the registry already knows, in case the node itself
                 // never answers: a listed node beats a missing one.
-                remember(&found, entry.clone());
+                found.borrow_mut().insert(id, entry.clone());
+                publish();
 
                 let Ok(node) = registry.bind::<Node, _>(global) else {
                     return;
@@ -201,10 +343,11 @@ pub fn nodes() -> Result<Vec<GraphNode>> {
                     .add_listener_local()
                     .info({
                         let found = Rc::clone(&found);
+                        let publish = Rc::clone(&publish);
                         move |info| {
                             let Some(props) = info.props() else { return };
-                            remember(
-                                &found,
+                            found.borrow_mut().insert(
+                                id,
                                 Found {
                                     node_name: props
                                         .get("node.name")
@@ -218,25 +361,82 @@ pub fn nodes() -> Result<Vec<GraphNode>> {
                                     ..entry.clone()
                                 },
                             );
+                            publish();
                         }
                     })
                     .register();
-                bound.borrow_mut().push((node, listener));
+                bound.borrow_mut().insert(id, (node, listener));
+            }
+        })
+        .global_remove({
+            let found = Rc::clone(&found);
+            let bound = Rc::clone(&bound);
+            let links = Rc::clone(&links);
+            let recorders = Rc::clone(&recorders);
+            let publish = Rc::clone(&publish);
+            move |id| {
+                let known = found.borrow_mut().remove(&id).is_some()
+                    | links.borrow_mut().remove(&id).is_some()
+                    | recorders.borrow_mut().remove(&id).is_some();
+                if known {
+                    bound.borrow_mut().remove(&id);
+                    publish();
+                }
             }
         })
         .register();
 
-    // Two round trips, because they answer two questions. The first brings
-    // every existing global — `done` means "you have seen them all" — and the
-    // second waits for what was bound during the first to describe itself.
+    // Two round trips before answering, because they answer two questions. The
+    // first brings every existing global — `done` means "you have seen them
+    // all" — and the second waits for what was bound during the first to
+    // describe itself. After that the events alone keep the list true.
     roundtrip(&core, &mainloop)?;
     roundtrip(&core, &mainloop)?;
+    publish();
+    let _ = ready.try_send(Ok(()));
 
-    let defaults = defaults.borrow().clone();
+    if !stopped.get() {
+        mainloop.run();
+    }
+    Ok(())
+}
+
+/// The collected nodes as a sorted list, defaults and activity resolved.
+fn snapshot(
+    found: &HashMap<u32, Found>,
+    defaults: &Defaults,
+    links: &HashMap<u32, (u32, u32)>,
+    recorders: &HashMap<u32, Recorder>,
+) -> Vec<GraphNode> {
+    let is_kind = |id: u32, kind: Kind| found.get(&id).is_some_and(|f| f.kind == kind);
+    // A stream that exists is not a stream that plays: a paused tab keeps its
+    // node linked to the output, corked, and would otherwise light the whole
+    // chain up.
+    let playing = |id: u32| {
+        found
+            .get(&id)
+            .is_some_and(|f| f.kind == Kind::Program && f.is_running)
+    };
+    let active = |id: u32, node: &Found| match node.kind {
+        // Something is playing into this output.
+        Kind::Sink => links.values().any(|(from, to)| *to == id && playing(*from)),
+        // Something other than this meter is recording from this input.
+        Kind::Source => links
+            .values()
+            .any(|(from, to)| *from == id && recorders.get(to).is_some_and(|r| !r.is_ours)),
+        // This program is turning, and it is playing into an output rather
+        // than only into whoever is metering it.
+        Kind::Program => {
+            node.is_running
+                && links
+                    .values()
+                    .any(|(from, to)| *from == id && is_kind(*to, Kind::Sink))
+        }
+    };
+
     let mut nodes: Vec<GraphNode> = found
-        .borrow()
         .iter()
-        .map(|f| GraphNode {
+        .map(|(id, f)| GraphNode {
             name: f.name.clone(),
             serial: f.serial.clone(),
             kind: f.kind,
@@ -245,19 +445,24 @@ pub fn nodes() -> Result<Vec<GraphNode>> {
                 Kind::Source => defaults.source.as_deref() == Some(&f.node_name),
                 Kind::Program => false,
             },
-            is_running: f.is_running,
+            is_active: active(*id, f),
         })
         .collect();
 
     // Outputs first: they are always there and always mean the same thing.
     // Programs next, inputs last, since a meter is rarely opened for a
-    // microphone.
-    nodes.sort_by_key(|n| match n.kind {
-        Kind::Sink => 0,
-        Kind::Program => 1,
-        Kind::Source => 2,
+    // microphone. Names break ties, so a map's own order never shows through.
+    nodes.sort_by(|a, b| {
+        let rank = |k: Kind| match k {
+            Kind::Sink => 0,
+            Kind::Program => 1,
+            Kind::Source => 2,
+        };
+        rank(a.kind)
+            .cmp(&rank(b.kind))
+            .then_with(|| a.name.cmp(&b.name))
     });
-    Ok(nodes)
+    nodes
 }
 
 /// What the graph said about the system's default devices.
@@ -275,6 +480,13 @@ struct Found {
     serial: String,
     kind: Kind,
     is_running: bool,
+}
+
+/// A recorder — anything capturing — as the graph announces it.
+#[derive(Debug, Clone)]
+struct Recorder {
+    /// True when it is this meter, whose own tap must not count as activity.
+    is_ours: bool,
 }
 
 /// The metadata stores `{"name":"alsa_output.…"}`; take the name out of it.
@@ -295,15 +507,6 @@ fn kind_of(props: &DictRef) -> Option<Kind> {
         "Audio/Source" | "Audio/Source/Virtual" => Some(Kind::Source),
         "Stream/Output/Audio" => Some(Kind::Program),
         _ => None,
-    }
-}
-
-/// Add a node, or replace what was known about the same one.
-fn remember(found: &Rc<RefCell<Vec<Found>>>, entry: Found) {
-    let mut found = found.borrow_mut();
-    match found.iter_mut().find(|f| f.serial == entry.serial) {
-        Some(known) => *known = entry,
-        None => found.push(entry),
     }
 }
 
@@ -392,7 +595,7 @@ fn run(
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
         *pw::keys::MEDIA_ROLE => "Music",
-        *pw::keys::NODE_NAME => "output-decibel-meter",
+        *pw::keys::NODE_NAME => METER_NODE_NAME,
         // What to tap. Without it the session manager would connect us to
         // whatever it thinks best, which is never what was asked for.
         *pw::keys::TARGET_OBJECT => target,

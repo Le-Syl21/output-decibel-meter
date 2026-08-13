@@ -2,12 +2,11 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use egui::{Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Vec2};
-use output_decibel_meter::capture::{self, CaptureMode};
+use output_decibel_meter::capture::{self, CaptureMode, SourceInfo};
 use output_decibel_meter::meter::{Meter, Reading};
 
 /// Bottom of the scales, in LUFS and dBTP. Below this a signal is inaudible in
@@ -20,13 +19,6 @@ const PEAK_FALL_DB_PER_S: f32 = 12.0;
 
 /// Points kept in the graph — about a minute at one point per 100 ms.
 const HISTORY: usize = 600;
-
-/// How often the source list is taken again.
-///
-/// Programs come and go while the window stays open, and a list frozen at
-/// startup would never show the one just started. Taken on a thread, because
-/// enumerating devices can take long enough to be seen as a stutter.
-const RELIST_EVERY: Duration = Duration::from_secs(2);
 
 /// What the capture thread publishes and the window reads.
 #[derive(Default)]
@@ -116,50 +108,6 @@ impl Drop for Worker {
     }
 }
 
-/// One line of the source list, as the window needs it.
-///
-/// A copy rather than a `Source`, because the list is taken on another thread
-/// and only strings cross over.
-#[derive(Clone, PartialEq)]
-struct Row {
-    name: String,
-    mode: CaptureMode,
-    is_output: bool,
-    /// Whether audio is passing through it, where the backend knows.
-    is_running: Option<bool>,
-    /// What reopens this exact source later, names being ambiguous.
-    key: String,
-}
-
-impl Row {
-    /// The kind of source, as the table shows it.
-    fn tag(&self) -> &'static str {
-        match (self.mode, self.is_output) {
-            (CaptureMode::Application, _) => "app",
-            (CaptureMode::Device, true) => "out",
-            (CaptureMode::Device, false) => "in",
-        }
-    }
-
-    /// Where this kind sorts, so outputs head the table as they did.
-    fn kind_order(&self) -> u8 {
-        match (self.mode, self.is_output) {
-            (CaptureMode::Device, true) => 0,
-            (CaptureMode::Application, _) => 1,
-            (CaptureMode::Device, false) => 2,
-        }
-    }
-
-    /// Whether it is passing audio, or a dash where that cannot be known.
-    fn state(&self) -> &'static str {
-        match self.is_running {
-            Some(true) => "running",
-            Some(false) => "idle",
-            None => "—",
-        }
-    }
-}
-
 /// Which column the table is sorted on.
 #[derive(Clone, Copy, PartialEq)]
 enum SortBy {
@@ -168,43 +116,54 @@ enum SortBy {
     State,
 }
 
-fn rows() -> Vec<Row> {
-    capture::sources()
-        .map(|list| {
-            list.into_iter()
-                .map(|s| Row {
-                    key: s.key(),
-                    name: s.name,
-                    mode: s.mode,
-                    is_output: s.is_output,
-                    is_running: s.is_running,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// The kind of source, as the table shows it.
+fn tag(source: &SourceInfo) -> &'static str {
+    match (source.mode, source.is_output) {
+        (CaptureMode::Application, _) => "app",
+        (CaptureMode::Device, true) => "out",
+        (CaptureMode::Device, false) => "in",
+    }
+}
+
+/// Where a kind sorts, so outputs head the table.
+fn kind_order(source: &SourceInfo) -> u8 {
+    match (source.mode, source.is_output) {
+        (CaptureMode::Device, true) => 0,
+        (CaptureMode::Application, _) => 1,
+        (CaptureMode::Device, false) => 2,
+    }
+}
+
+/// Whether audio flows through it, or a dash where that cannot be known.
+fn state(source: &SourceInfo) -> &'static str {
+    match source.is_active {
+        Some(true) => "active",
+        Some(false) => "idle",
+        None => "—",
+    }
 }
 
 struct MeterApp {
-    sources: Vec<Row>,
+    sources: Vec<SourceInfo>,
     /// The source being metered, kept whole: it may leave the list while it is
     /// still what the window is showing.
-    selected: Option<Row>,
+    selected: Option<SourceInfo>,
     worker: Option<Worker>,
     /// Falling peak marker, in dB.
     peak_marker: f32,
-    /// A list being taken on another thread, if one is.
-    relisting: Option<Receiver<Vec<Row>>>,
-    last_relist: Instant,
+    /// The list, kept up to date by the graph itself rather than polled.
+    listing: capture::Listing,
     sort: SortBy,
     ascending: bool,
 }
 
 impl MeterApp {
     fn new() -> Self {
-        let sources = rows();
-        // Start on the system output rather than on whatever heads the list:
-        // cpal opens with JACK and the sound servers, which are rarely what a
-        // window opened to watch the speakers should be metering.
+        let listing = capture::listing();
+        let sources = listing.sources();
+        // Start on the system output rather than on whatever heads the list: a
+        // fallback listing opens with JACK and the sound servers, which are
+        // rarely what a window opened to watch the speakers should meter.
         let default = capture::default_output().ok().map(|s| s.key());
         let selected = default
             .and_then(|key| sources.iter().find(|r| r.key == key).cloned())
@@ -214,8 +173,7 @@ impl MeterApp {
             sources,
             worker: None,
             peak_marker: FLOOR_DB,
-            relisting: None,
-            last_relist: Instant::now(),
+            listing,
             // Outputs, then programs, then inputs: the order the graph itself
             // reports, and the one a meter is usually opened for.
             sort: SortBy::Kind,
@@ -234,42 +192,19 @@ impl MeterApp {
         }
     }
 
-    /// Take the source list again, off the painting thread.
-    fn relist(&mut self) {
-        match &self.relisting {
-            Some(pending) => match pending.try_recv() {
-                Ok(sources) => {
-                    self.sources = sources;
-                    self.relisting = None;
-                    self.last_relist = Instant::now();
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => self.relisting = None,
-            },
-            None if self.last_relist.elapsed() >= RELIST_EVERY => {
-                let (tx, rx) = channel();
-                std::thread::spawn(move || {
-                    let _ = tx.send(rows());
-                });
-                self.relisting = Some(rx);
-            }
-            None => {}
-        }
-    }
-
     /// The rows in the order the table shows them.
     ///
-    /// Sorted on display rather than on arrival, so a list taken again every
-    /// two seconds does not have to remember how it was asked to be ordered.
-    fn sorted(&self) -> Vec<Row> {
+    /// Sorted on display rather than on arrival, so a list that changes under
+    /// the window does not have to remember how it was asked to be ordered.
+    fn sorted(&self) -> Vec<SourceInfo> {
         let mut rows = self.sources.clone();
         rows.sort_by(|a, b| {
             let order = match self.sort {
-                SortBy::Kind => a.kind_order().cmp(&b.kind_order()),
+                SortBy::Kind => kind_order(a).cmp(&kind_order(b)),
                 SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                // Running first when ascending: what is playing is what one
+                // Active first when ascending: what is playing is what one
                 // came to meter.
-                SortBy::State => b.is_running.cmp(&a.is_running),
+                SortBy::State => b.is_active.cmp(&a.is_active),
             };
             // Ties fall back on the name, so the table never reshuffles rows
             // that compare equal from one listing to the next.
@@ -311,14 +246,17 @@ impl MeterApp {
                                     ("state", SortBy::State),
                                     ("source", SortBy::Name),
                                 ] {
+                                    // ⏶ and ⏷ rather than ▲ and ▼: the
+                                    // proportional font carries no geometric
+                                    // shapes, and a missing glyph is drawn as
+                                    // an empty box.
                                     let mark = match (self.sort == column, self.ascending) {
-                                        (true, true) => " ▲",
-                                        (true, false) => " ▼",
+                                        (true, true) => " ⏶",
+                                        (true, false) => " ⏷",
                                         (false, _) => "",
                                     };
-                                    let header = egui::RichText::new(format!("{label}{mark}"))
-                                        .weak()
-                                        .small();
+                                    let header =
+                                        egui::RichText::new(format!("{label}{mark}")).strong();
                                     if ui
                                         .add(egui::Button::new(header).frame(false))
                                         .on_hover_text("sort on this column")
@@ -340,8 +278,8 @@ impl MeterApp {
                                     // columns line up under their headers; any
                                     // of them selects the source.
                                     let mut clicked =
-                                        ui.selectable_label(selected, row.tag()).clicked();
-                                    clicked |= ui.selectable_label(selected, row.state()).clicked();
+                                        ui.selectable_label(selected, tag(row)).clicked();
+                                    clicked |= ui.selectable_label(selected, state(row)).clicked();
                                     clicked |= ui.selectable_label(selected, &row.name).clicked();
                                     if clicked {
                                         chosen_row = Some(row.clone());
@@ -425,9 +363,8 @@ impl eframe::App for MeterApp {
             self.peak_marker = reading.recent_peak as f32;
         }
 
-        // The list is a snapshot of what is playing, so it is taken again while
-        // the window is open.
-        self.relist();
+        // The list keeps itself up to date; reading it is a clone under a lock.
+        self.sources = self.listing.sources();
         let stopped = self.selection_is_gone();
 
         // Bottom first: egui gives the central panel whatever the side panels
@@ -601,14 +538,19 @@ fn draw_history(ui: &mut egui::Ui, history: &[(f32, f32)]) {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([560.0, 520.0])
-            .with_min_inner_size([420.0, 400.0])
+            .with_inner_size([840.0, 780.0])
+            .with_min_inner_size([620.0, 600.0])
             .with_title("Output decibel meter"),
         ..Default::default()
     };
     eframe::run_native(
         "output-decibel-meter",
         options,
-        Box::new(|_cc| Ok(Box::new(MeterApp::new()))),
+        Box::new(|cc| {
+            // Everything half again as large: a meter is read from a step back,
+            // next to whatever is being listened to.
+            cc.egui_ctx.set_zoom_factor(1.5);
+            Ok(Box::new(MeterApp::new()))
+        }),
     )
 }

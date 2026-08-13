@@ -31,7 +31,7 @@ fn main() -> Result<()> {
 
     if cli.list {
         for source in capture::sources()? {
-            println!("  {} {}", tag(&source), source.name);
+            println!("  {} {:<8} {}", tag(&source), state(&source), source.name);
         }
         return Ok(());
     }
@@ -87,6 +87,16 @@ fn tag(source: &Source) -> &'static str {
         (CaptureMode::Application, _) => "[app]   ",
         (CaptureMode::Device, true) => "[output]",
         (CaptureMode::Device, false) => "[input] ",
+    }
+}
+
+/// Whether audio flows through it, this meter's own tap excluded, or a dash
+/// where the backend cannot tell.
+fn state(source: &Source) -> &'static str {
+    match source.is_active {
+        Some(true) => "active",
+        Some(false) => "idle",
+        None => "—",
     }
 }
 

@@ -5,7 +5,9 @@
 //! Whichever is used, the result is the same thing: blocks of interleaved `f32`
 //! frames, handed over on a channel so the audio callback stays short.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -54,9 +56,9 @@ pub struct Source {
     pub mode: CaptureMode,
     /// True for an output device, captured through loopback.
     pub is_output: bool,
-    /// Whether audio is passing through it right now, where the backend knows.
-    /// `cpal` does not, and answers `None`.
-    pub is_running: Option<bool>,
+    /// Whether audio flows through it besides this meter, where the backend
+    /// knows. `cpal` cannot tell, and answers `None`.
+    pub is_active: Option<bool>,
     handle: Handle,
 }
 
@@ -172,7 +174,7 @@ pub fn sources() -> Result<Vec<Source>> {
             name,
             mode: CaptureMode::Device,
             is_output: true,
-            is_running: None,
+            is_active: None,
             handle: Handle::Device(device),
         });
     }
@@ -186,7 +188,7 @@ pub fn sources() -> Result<Vec<Source>> {
             name,
             mode: CaptureMode::Device,
             is_output: false,
-            is_running: None,
+            is_active: None,
             handle: Handle::Device(device),
         });
     }
@@ -226,7 +228,7 @@ fn from_graph(node: crate::graph::GraphNode) -> Source {
             Kind::Sink | Kind::Source => CaptureMode::Device,
         },
         is_output: node.kind != Kind::Source,
-        is_running: Some(node.is_running),
+        is_active: Some(node.is_active),
         handle: Handle::Graph {
             serial: node.serial,
             kind: node.kind,
@@ -251,7 +253,7 @@ pub fn default_output() -> Result<Source> {
         name: describe(&device),
         mode: CaptureMode::Device,
         is_output: true,
-        is_running: None,
+        is_active: None,
         handle: Handle::Device(device),
     })
 }
@@ -272,6 +274,128 @@ fn graph_default_output() -> Option<Source> {
 #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
 fn graph_default_output() -> Option<Source> {
     None
+}
+
+/// A source as it can be listed, sorted and shown, without holding it open.
+///
+/// A [`Source`] carries a device or a graph target, which cannot cross threads
+/// on every platform; this is the part that can, and it reopens through
+/// [`by_key`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceInfo {
+    /// Name as the system reports it.
+    pub name: String,
+    /// How it would be tapped.
+    pub mode: CaptureMode,
+    /// True for an output, captured through loopback.
+    pub is_output: bool,
+    /// Whether audio flows through it besides this meter, where that is known.
+    pub is_active: Option<bool>,
+    /// What [`by_key`] reopens it with.
+    pub key: String,
+}
+
+impl Source {
+    /// This source as it can be listed and kept.
+    pub fn info(&self) -> SourceInfo {
+        SourceInfo {
+            name: self.name.clone(),
+            mode: self.mode,
+            is_output: self.is_output,
+            is_active: self.is_active,
+            key: self.key(),
+        }
+    }
+}
+
+/// A list of sources that keeps itself up to date.
+///
+/// Where the graph can be watched, it is: PipeWire announces a node the moment
+/// it appears, so a program that starts playing is in the list as it starts,
+/// with no polling at all. Elsewhere the list is taken again on a thread of its
+/// own, which is the same promise at a coarser grain.
+pub struct Listing {
+    inner: Inner,
+}
+
+enum Inner {
+    #[cfg(all(target_os = "linux", feature = "pipewire"))]
+    Watched(crate::graph::Watch),
+    Polled(Polled),
+}
+
+impl Listing {
+    /// The sources as they stand now.
+    pub fn sources(&self) -> Vec<SourceInfo> {
+        match &self.inner {
+            #[cfg(all(target_os = "linux", feature = "pipewire"))]
+            Inner::Watched(watch) => watch
+                .nodes()
+                .into_iter()
+                .map(|n| from_graph(n).info())
+                .collect(),
+            Inner::Polled(polled) => polled
+                .seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        }
+    }
+}
+
+/// Start listing, live where that is possible.
+pub fn listing() -> Listing {
+    #[cfg(all(target_os = "linux", feature = "pipewire"))]
+    if let Ok(watch) = crate::graph::watch() {
+        return Listing {
+            inner: Inner::Watched(watch),
+        };
+    }
+    Listing {
+        inner: Inner::Polled(Polled::start()),
+    }
+}
+
+/// How often a polled listing is taken again.
+const POLL_EVERY: Duration = std::time::Duration::from_secs(2);
+
+/// The fallback: a thread taking the list again, forever.
+struct Polled {
+    seen: Arc<Mutex<Vec<SourceInfo>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Polled {
+    fn start() -> Self {
+        let seen = Arc::new(Mutex::new(listed()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_seen = Arc::clone(&seen);
+        let thread_stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(POLL_EVERY);
+                if thread_stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let taken = listed();
+                *thread_seen.lock().unwrap_or_else(|e| e.into_inner()) = taken;
+            }
+        });
+        Self { seen, stop }
+    }
+}
+
+impl Drop for Polled {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// One listing, as descriptions.
+fn listed() -> Vec<SourceInfo> {
+    sources()
+        .map(|list| list.iter().map(Source::info).collect())
+        .unwrap_or_default()
 }
 
 /// Find a source whose name contains `fragment`, case-insensitively.

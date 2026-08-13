@@ -72,6 +72,15 @@ output-decibel-meter --source "Firefox"
 ```
 
 ```
+$ output-decibel-meter --list
+  [output] active   Audio interne Stéréo analogique
+  [output] idle     HyperX 7.1 Audio Stéréo numérique (IEC958)
+  [app]    active   Firefox — Panneaux solaires à brancher sur une prise
+  [app]    idle     speech-dispatcher-dummy — playback
+  [input]  idle     Audio interne Stéréo analogique
+```
+
+```
 metering Audio interne Stéréo analogique
   output device, captured in loopback — the system volume may be included…
 2 channels at 48000 Hz
@@ -83,7 +92,15 @@ metering Audio interne Stéréo analogique
 The meter window adds a level bar with a falling peak marker, a scrolling graph
 of short-term loudness with the peak line above it, and a reset button that
 starts the figures again **without interrupting the capture** — which is what
-makes an A/B comparison possible.
+makes an A/B comparison possible. Each figure carries the window it was taken
+over, since three loudness numbers that differ only by how far back they look
+cannot be read without it.
+
+The sources are a table, sortable on any column, and it is live: PipeWire
+announces a node as it appears, so a program shows up in the list the moment it
+starts playing. The `state` column says whether audio flows through a source
+*besides this meter* — metering an output would otherwise start it turning and
+report "running" to the very act of looking at it.
 
 ```sh
 cargo run --release --features gui --bin output-decibel-meter-gui

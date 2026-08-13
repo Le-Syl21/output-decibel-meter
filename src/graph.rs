@@ -70,6 +70,9 @@ pub struct GraphNode {
     pub kind: Kind,
     /// True for the sink or the source the system currently defaults to.
     pub is_default: bool,
+    /// True while the node is actually passing audio, as opposed to sitting
+    /// idle with nothing playing through it.
+    pub is_running: bool,
 }
 
 /// What the capture thread needs to answer a `stop` and be waited on.
@@ -183,6 +186,8 @@ pub fn nodes() -> Result<Vec<GraphNode>> {
                     name: name_of(props, kind),
                     serial: serial.to_string(),
                     kind,
+                    // Only the node itself says so; the registry does not.
+                    is_running: false,
                 };
 
                 // What the registry already knows, in case the node itself
@@ -206,6 +211,10 @@ pub fn nodes() -> Result<Vec<GraphNode>> {
                                         .unwrap_or(&entry.node_name)
                                         .to_string(),
                                     name: name_of(props, kind),
+                                    is_running: matches!(
+                                        info.state(),
+                                        pw::node::NodeState::Running
+                                    ),
                                     ..entry.clone()
                                 },
                             );
@@ -236,6 +245,7 @@ pub fn nodes() -> Result<Vec<GraphNode>> {
                 Kind::Source => defaults.source.as_deref() == Some(&f.node_name),
                 Kind::Program => false,
             },
+            is_running: f.is_running,
         })
         .collect();
 
@@ -264,6 +274,7 @@ struct Found {
     name: String,
     serial: String,
     kind: Kind,
+    is_running: bool,
 }
 
 /// The metadata stores `{"name":"alsa_output.…"}`; take the name out of it.

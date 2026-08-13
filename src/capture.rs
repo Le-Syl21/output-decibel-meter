@@ -54,6 +54,9 @@ pub struct Source {
     pub mode: CaptureMode,
     /// True for an output device, captured through loopback.
     pub is_output: bool,
+    /// Whether audio is passing through it right now, where the backend knows.
+    /// `cpal` does not, and answers `None`.
+    pub is_running: Option<bool>,
     handle: Handle,
 }
 
@@ -169,6 +172,7 @@ pub fn sources() -> Result<Vec<Source>> {
             name,
             mode: CaptureMode::Device,
             is_output: true,
+            is_running: None,
             handle: Handle::Device(device),
         });
     }
@@ -182,6 +186,7 @@ pub fn sources() -> Result<Vec<Source>> {
             name,
             mode: CaptureMode::Device,
             is_output: false,
+            is_running: None,
             handle: Handle::Device(device),
         });
     }
@@ -221,6 +226,7 @@ fn from_graph(node: crate::graph::GraphNode) -> Source {
             Kind::Sink | Kind::Source => CaptureMode::Device,
         },
         is_output: node.kind != Kind::Source,
+        is_running: Some(node.is_running),
         handle: Handle::Graph {
             serial: node.serial,
             kind: node.kind,
@@ -245,6 +251,7 @@ pub fn default_output() -> Result<Source> {
         name: describe(&device),
         mode: CaptureMode::Device,
         is_output: true,
+        is_running: None,
         handle: Handle::Device(device),
     })
 }

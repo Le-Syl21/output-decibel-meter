@@ -21,9 +21,6 @@ const PEAK_FALL_DB_PER_S: f32 = 12.0;
 /// Points kept in the graph — about a minute at one point per 100 ms.
 const HISTORY: usize = 600;
 
-/// Height of the source table, about four lines; the rest scrolls.
-const TABLE_HEIGHT: f32 = 96.0;
-
 /// How often the source list is taken again.
 ///
 /// Programs come and go while the window stays open, and a list frozen at
@@ -128,19 +125,47 @@ struct Row {
     name: String,
     mode: CaptureMode,
     is_output: bool,
+    /// Whether audio is passing through it, where the backend knows.
+    is_running: Option<bool>,
     /// What reopens this exact source later, names being ambiguous.
     key: String,
 }
 
 impl Row {
-    /// The kind of source, in a fixed-width column so the table lines up.
+    /// The kind of source, as the table shows it.
     fn tag(&self) -> &'static str {
         match (self.mode, self.is_output) {
             (CaptureMode::Application, _) => "app",
             (CaptureMode::Device, true) => "out",
-            (CaptureMode::Device, false) => "in ",
+            (CaptureMode::Device, false) => "in",
         }
     }
+
+    /// Where this kind sorts, so outputs head the table as they did.
+    fn kind_order(&self) -> u8 {
+        match (self.mode, self.is_output) {
+            (CaptureMode::Device, true) => 0,
+            (CaptureMode::Application, _) => 1,
+            (CaptureMode::Device, false) => 2,
+        }
+    }
+
+    /// Whether it is passing audio, or a dash where that cannot be known.
+    fn state(&self) -> &'static str {
+        match self.is_running {
+            Some(true) => "running",
+            Some(false) => "idle",
+            None => "—",
+        }
+    }
+}
+
+/// Which column the table is sorted on.
+#[derive(Clone, Copy, PartialEq)]
+enum SortBy {
+    Kind,
+    Name,
+    State,
 }
 
 fn rows() -> Vec<Row> {
@@ -152,6 +177,7 @@ fn rows() -> Vec<Row> {
                     name: s.name,
                     mode: s.mode,
                     is_output: s.is_output,
+                    is_running: s.is_running,
                 })
                 .collect()
         })
@@ -169,6 +195,8 @@ struct MeterApp {
     /// A list being taken on another thread, if one is.
     relisting: Option<Receiver<Vec<Row>>>,
     last_relist: Instant,
+    sort: SortBy,
+    ascending: bool,
 }
 
 impl MeterApp {
@@ -188,6 +216,10 @@ impl MeterApp {
             peak_marker: FLOOR_DB,
             relisting: None,
             last_relist: Instant::now(),
+            // Outputs, then programs, then inputs: the order the graph itself
+            // reports, and the one a meter is usually opened for.
+            sort: SortBy::Kind,
+            ascending: true,
         };
         app.restart();
         app
@@ -222,6 +254,120 @@ impl MeterApp {
                 self.relisting = Some(rx);
             }
             None => {}
+        }
+    }
+
+    /// The rows in the order the table shows them.
+    ///
+    /// Sorted on display rather than on arrival, so a list taken again every
+    /// two seconds does not have to remember how it was asked to be ordered.
+    fn sorted(&self) -> Vec<Row> {
+        let mut rows = self.sources.clone();
+        rows.sort_by(|a, b| {
+            let order = match self.sort {
+                SortBy::Kind => a.kind_order().cmp(&b.kind_order()),
+                SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                // Running first when ascending: what is playing is what one
+                // came to meter.
+                SortBy::State => b.is_running.cmp(&a.is_running),
+            };
+            // Ties fall back on the name, so the table never reshuffles rows
+            // that compare equal from one listing to the next.
+            let order = order.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            if self.ascending {
+                order
+            } else {
+                order.reverse()
+            }
+        });
+        rows
+    }
+
+    /// The source table: headers that sort, one clickable line per source.
+    ///
+    /// It fills whatever height the meter left, so a machine with three sources
+    /// shows three lines and one with twenty scrolls — rather than a box of a
+    /// fixed size, empty in the first case and cramped in the second.
+    fn draw_table(&mut self, ui: &mut egui::Ui) {
+        let rows = self.sorted();
+        let mut chosen_row = None;
+        let mut sort_on = None;
+
+        egui::Frame::new()
+            .fill(ui.visuals().extreme_bg_color)
+            .corner_radius(CornerRadius::same(3))
+            .inner_margin(6.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new("sources")
+                            .num_columns(3)
+                            .spacing([10.0, 3.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for (label, column) in [
+                                    ("kind", SortBy::Kind),
+                                    ("state", SortBy::State),
+                                    ("source", SortBy::Name),
+                                ] {
+                                    let mark = match (self.sort == column, self.ascending) {
+                                        (true, true) => " ▲",
+                                        (true, false) => " ▼",
+                                        (false, _) => "",
+                                    };
+                                    let header = egui::RichText::new(format!("{label}{mark}"))
+                                        .weak()
+                                        .small();
+                                    if ui
+                                        .add(egui::Button::new(header).frame(false))
+                                        .on_hover_text("sort on this column")
+                                        .clicked()
+                                    {
+                                        sort_on = Some(column);
+                                    }
+                                }
+                                ui.end_row();
+
+                                if rows.is_empty() {
+                                    ui.label(egui::RichText::new("nothing to meter").weak());
+                                    ui.end_row();
+                                }
+                                for row in &rows {
+                                    let selected =
+                                        self.selected.as_ref().is_some_and(|s| s.key == row.key);
+                                    // Three cells rather than one line, so the
+                                    // columns line up under their headers; any
+                                    // of them selects the source.
+                                    let mut clicked =
+                                        ui.selectable_label(selected, row.tag()).clicked();
+                                    clicked |= ui.selectable_label(selected, row.state()).clicked();
+                                    clicked |= ui.selectable_label(selected, &row.name).clicked();
+                                    if clicked {
+                                        chosen_row = Some(row.clone());
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+
+        if let Some(column) = sort_on {
+            self.sort_on(column);
+        }
+        if let Some(row) = chosen_row {
+            self.selected = Some(row);
+            self.restart();
+        }
+    }
+
+    /// Click a header: sort on it, or turn the order around if it already does.
+    fn sort_on(&mut self, column: SortBy) {
+        if self.sort == column {
+            self.ascending = !self.ascending;
+        } else {
+            self.sort = column;
+            self.ascending = true;
         }
     }
 
@@ -284,52 +430,11 @@ impl eframe::App for MeterApp {
         self.relist();
         let stopped = self.selection_is_gone();
 
-        egui::Panel::top("source").show(root, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Metering").weak().small());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Reset").clicked()
-                        && let Some(worker) = &self.worker
-                    {
-                        worker.reset.store(true, Ordering::Relaxed);
-                        self.peak_marker = FLOOR_DB;
-                    }
-                });
-            });
-
-            // A table rather than a drop-down: what is playing changes on its
-            // own, and a list one has to open to see is a list one does not see.
-            let mut changed = None;
-            egui::Frame::new()
-                .fill(ui.visuals().extreme_bg_color)
-                .corner_radius(CornerRadius::same(3))
-                .inner_margin(4.0)
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(TABLE_HEIGHT)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            if self.sources.is_empty() {
-                                ui.label(egui::RichText::new("nothing to meter").weak());
-                            }
-                            for row in &self.sources {
-                                let chosen =
-                                    self.selected.as_ref().is_some_and(|s| s.key == row.key);
-                                let line = format!("{}  {}", row.tag(), row.name);
-                                if ui
-                                    .selectable_label(chosen, egui::RichText::new(line).monospace())
-                                    .clicked()
-                                {
-                                    changed = Some(row.clone());
-                                }
-                            }
-                        });
-                });
-            if let Some(row) = changed {
-                self.selected = Some(row);
-                self.restart();
-            }
+        // Bottom first: egui gives the central panel whatever the side panels
+        // leave, which is exactly the rule wanted here — the meter takes the
+        // room it needs, the table takes the rest.
+        egui::Panel::bottom("meter").show(root, |ui| {
+            ui.add_space(6.0);
 
             // Where the tap sits changes what the numbers mean, so it is said
             // on screen rather than buried in a manual.
@@ -345,16 +450,15 @@ impl eframe::App for MeterApp {
                 let line = if stopped {
                     format!("{} — stopped; still showing what it played", row.name)
                 } else {
-                    format!("{shape}{note}")
+                    format!("{} — {shape}{note}", row.name)
                 };
                 ui.label(egui::RichText::new(line).weak().small());
+                ui.add_space(4.0);
             }
-            ui.add_space(4.0);
-        });
 
-        egui::CentralPanel::default().show(root, |ui| {
-            if let Some(error) = error {
+            if let Some(error) = &error {
                 ui.colored_label(Color32::from_rgb(206, 84, 74), error);
+                ui.add_space(6.0);
                 return;
             }
 
@@ -380,6 +484,23 @@ impl eframe::App for MeterApp {
                     figure(ui, "true peak", reading.true_peak, "dBTP", &since_reset);
                     ui.end_row();
                 });
+            ui.add_space(6.0);
+        });
+
+        egui::CentralPanel::default().show(root, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Metering").weak().small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Reset").clicked()
+                        && let Some(worker) = &self.worker
+                    {
+                        worker.reset.store(true, Ordering::Relaxed);
+                        self.peak_marker = FLOOR_DB;
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            self.draw_table(ui);
         });
     }
 }

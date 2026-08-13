@@ -1,0 +1,134 @@
+name: CI
+
+# No build on push to `main`: work lands directly there, so a build per commit
+# would only add noise. The gates run on pull requests, on tags (before anything
+# is published) and on demand.
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      # First gate of the pipeline: a tag must match the version the crate would
+      # publish. Without it, tagging v0.2.0 while Cargo.toml still says 0.1.0
+      # produces a release nobody can install, and the run stays green.
+      - name: Check that the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          tag="${tag%%-*}"                  # v1.2.3-rc1 → 1.2.3
+          crate=$(cargo pkgid -p output-decibel-meter)
+          crate="${crate##*[@#]}"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME but Cargo.toml says $crate — update Cargo.toml and retag"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches Cargo.toml $crate"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+
+      # ALSA for cpal, GTK for the file dialogs eframe pulls in.
+      - name: Install audio and GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libglib2.0-dev
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy (library and CLI)
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Clippy (GUI)
+        run: cargo clippy --release --features gui --all-targets -- -D warnings
+
+  build:
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            label: linux-aarch64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            label: macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.label }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          toolchain: stable
+          # Needed for the macOS x86_64 cross build: the runner is arm64.
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+
+      - name: Install audio and GUI dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libglib2.0-dev
+
+      - name: Build CLI
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build GUI
+        run: cargo build --release --target ${{ matrix.target }} --features gui
+
+      # The tests measure synthesized tones; they never open a device, so they
+      # run everywhere except where the binary cannot execute.
+      - name: Run tests
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          tar czf output-decibel-meter-${{ matrix.label }}.tar.gz \
+            -C target/${{ matrix.target }}/release \
+            output-decibel-meter output-decibel-meter-gui
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Compress-Archive -Path `
+            target/${{ matrix.target }}/release/output-decibel-meter.exe, `
+            target/${{ matrix.target }}/release/output-decibel-meter-gui.exe `
+            -DestinationPath output-decibel-meter-${{ matrix.label }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: output-decibel-meter-${{ matrix.label }}
+          path: output-decibel-meter-${{ matrix.label }}.*

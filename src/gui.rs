@@ -21,6 +21,9 @@ const PEAK_FALL_DB_PER_S: f32 = 12.0;
 /// Points kept in the graph — about a minute at one point per 100 ms.
 const HISTORY: usize = 600;
 
+/// Height of the source table, about four lines; the rest scrolls.
+const TABLE_HEIGHT: f32 = 96.0;
+
 /// How often the source list is taken again.
 ///
 /// Programs come and go while the window stays open, and a list frozen at
@@ -127,6 +130,17 @@ struct Row {
     is_output: bool,
     /// What reopens this exact source later, names being ambiguous.
     key: String,
+}
+
+impl Row {
+    /// The kind of source, in a fixed-width column so the table lines up.
+    fn tag(&self) -> &'static str {
+        match (self.mode, self.is_output) {
+            (CaptureMode::Application, _) => "app",
+            (CaptureMode::Device, true) => "out",
+            (CaptureMode::Device, false) => "in ",
+        }
+    }
 }
 
 fn rows() -> Vec<Row> {
@@ -266,52 +280,56 @@ impl eframe::App for MeterApp {
         }
 
         // The list is a snapshot of what is playing, so it is taken again while
-        // the window is open, and the id salt follows its length: an egui popup
-        // keeps the size it was first shown at.
+        // the window is open.
         self.relist();
         let stopped = self.selection_is_gone();
 
         egui::Panel::top("source").show(root, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let label = match &self.selected {
-                    Some(row) if stopped => format!("{} — stopped", row.name),
-                    Some(row) => row.name.clone(),
-                    None => "no source".to_string(),
-                };
-
-                let mut changed = None;
-                egui::ComboBox::from_id_salt(("source", self.sources.len()))
-                    .selected_text(label)
-                    .width(360.0)
-                    .show_ui(ui, |ui| {
-                        for row in &self.sources {
-                            let tag = match (row.mode, row.is_output) {
-                                (CaptureMode::Application, _) => "app",
-                                (CaptureMode::Device, true) => "out",
-                                (CaptureMode::Device, false) => "in ",
-                            };
-                            let chosen = self.selected.as_ref().is_some_and(|s| s.key == row.key);
-                            if ui
-                                .selectable_label(chosen, format!("[{tag}] {}", row.name))
-                                .clicked()
-                            {
-                                changed = Some(row.clone());
-                            }
-                        }
-                    });
-                if let Some(row) = changed {
-                    self.selected = Some(row);
-                    self.restart();
-                }
-
-                if ui.button("Reset").clicked()
-                    && let Some(worker) = &self.worker
-                {
-                    worker.reset.store(true, Ordering::Relaxed);
-                    self.peak_marker = FLOOR_DB;
-                }
+                ui.label(egui::RichText::new("Metering").weak().small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Reset").clicked()
+                        && let Some(worker) = &self.worker
+                    {
+                        worker.reset.store(true, Ordering::Relaxed);
+                        self.peak_marker = FLOOR_DB;
+                    }
+                });
             });
+
+            // A table rather than a drop-down: what is playing changes on its
+            // own, and a list one has to open to see is a list one does not see.
+            let mut changed = None;
+            egui::Frame::new()
+                .fill(ui.visuals().extreme_bg_color)
+                .corner_radius(CornerRadius::same(3))
+                .inner_margin(4.0)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(TABLE_HEIGHT)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            if self.sources.is_empty() {
+                                ui.label(egui::RichText::new("nothing to meter").weak());
+                            }
+                            for row in &self.sources {
+                                let chosen =
+                                    self.selected.as_ref().is_some_and(|s| s.key == row.key);
+                                let line = format!("{}  {}", row.tag(), row.name);
+                                if ui
+                                    .selectable_label(chosen, egui::RichText::new(line).monospace())
+                                    .clicked()
+                                {
+                                    changed = Some(row.clone());
+                                }
+                            }
+                        });
+                });
+            if let Some(row) = changed {
+                self.selected = Some(row);
+                self.restart();
+            }
 
             // Where the tap sits changes what the numbers mean, so it is said
             // on screen rather than buried in a manual.
@@ -324,7 +342,12 @@ impl eframe::App for MeterApp {
                 let shape = format
                     .map(|(ch, rate)| format!("{ch} ch at {rate} Hz — "))
                     .unwrap_or_default();
-                ui.label(egui::RichText::new(format!("{shape}{note}")).weak().small());
+                let line = if stopped {
+                    format!("{} — stopped; still showing what it played", row.name)
+                } else {
+                    format!("{shape}{note}")
+                };
+                ui.label(egui::RichText::new(line).weak().small());
             }
             ui.add_space(4.0);
         });
@@ -340,28 +363,30 @@ impl eframe::App for MeterApp {
             draw_history(ui, &history);
             ui.add_space(8.0);
 
+            // Every figure with the window it was taken over: three loudness
+            // numbers that differ only by how long they look back are three
+            // numbers one cannot read without knowing that.
+            let since_reset = format!("{:.1} s, since reset", reading.seconds);
             egui::Grid::new("figures")
-                .num_columns(4)
+                .num_columns(3)
                 .spacing([18.0, 4.0])
                 .show(ui, |ui| {
-                    figure(ui, "momentary", reading.momentary, "LUFS");
-                    figure(ui, "short term", reading.short_term, "LUFS");
+                    figure(ui, "momentary", reading.momentary, "LUFS", "400 ms");
                     ui.end_row();
-                    figure(ui, "integrated", reading.integrated, "LUFS");
-                    figure(ui, "true peak", reading.true_peak, "dBTP");
+                    figure(ui, "short term", reading.short_term, "LUFS", "3 s");
+                    ui.end_row();
+                    figure(ui, "integrated", reading.integrated, "LUFS", &since_reset);
+                    ui.end_row();
+                    figure(ui, "true peak", reading.true_peak, "dBTP", &since_reset);
                     ui.end_row();
                 });
-            ui.label(
-                egui::RichText::new(format!("{:.1} s since reset", reading.seconds))
-                    .weak()
-                    .small(),
-            );
         });
     }
 }
 
-/// One labelled number, or a dash when there is nothing to show.
-fn figure(ui: &mut egui::Ui, label: &str, value: f64, unit: &str) {
+/// One labelled number and the window it covers, or a dash when there is
+/// nothing to show yet.
+fn figure(ui: &mut egui::Ui, label: &str, value: f64, unit: &str, window: &str) {
     ui.label(egui::RichText::new(label).weak());
     let text = if value.is_finite() {
         format!("{value:>7.1} {unit}")
@@ -369,6 +394,7 @@ fn figure(ui: &mut egui::Ui, label: &str, value: f64, unit: &str) {
         format!("{:>7} {unit}", "—")
     };
     ui.monospace(text);
+    ui.label(egui::RichText::new(window).weak().small());
 }
 
 /// The level bar, with the falling peak marker over it.
@@ -454,8 +480,8 @@ fn draw_history(ui: &mut egui::Ui, history: &[(f32, f32)]) {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([560.0, 380.0])
-            .with_min_inner_size([420.0, 300.0])
+            .with_inner_size([560.0, 520.0])
+            .with_min_inner_size([420.0, 400.0])
             .with_title("Output decibel meter"),
         ..Default::default()
     };

@@ -243,6 +243,8 @@ fn describe_machine() {
     );
     let backend = if cfg!(all(target_os = "linux", feature = "pipewire")) {
         "PipeWire graph, with cpal as the fallback"
+    } else if cfg!(target_os = "windows") {
+        "WASAPI, with cpal as the fallback"
     } else {
         "cpal only"
     };

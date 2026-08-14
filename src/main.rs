@@ -4,10 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
 use output_decibel_meter::capture::{self, CaptureMode, Source};
 use output_decibel_meter::meter::Meter;
+use output_decibel_meter::selftest;
 
 #[derive(Parser)]
 #[command(
@@ -24,10 +25,18 @@ struct Cli {
     /// List what can be metered and exit.
     #[arg(long)]
     list: bool,
+    /// Play a tone of a known level, meter it back, and report whether the
+    /// figures match. Meters this process, so nothing else has to stop.
+    #[arg(long)]
+    self_test: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.self_test {
+        return self_test();
+    }
 
     if cli.list {
         for source in capture::sources()? {
@@ -88,6 +97,43 @@ fn tag(source: &Source) -> &'static str {
         (CaptureMode::Device, true) => "[output]",
         (CaptureMode::Device, false) => "[input] ",
     }
+}
+
+/// Play a tone, meter it back, and say whether the chain holds up.
+fn self_test() -> Result<()> {
+    let report = selftest::run()?;
+    println!("metering {}", report.source);
+    println!(
+        "  {}",
+        match report.mode {
+            CaptureMode::Application =>
+                "this process's own stream — anything else may keep playing",
+            CaptureMode::Device => "an output in loopback — nothing else must be playing",
+        }
+    );
+    println!();
+
+    for check in &report.checks {
+        println!(
+            "  {:<34} {:>7.1} {:<5} expected {:>6.1} ± {:.1}   {}",
+            check.what,
+            check.measured,
+            check.unit,
+            check.expected,
+            check.tolerance,
+            if check.passed() { "ok" } else { "FAILED" }
+        );
+    }
+    println!();
+
+    if report.passed() {
+        println!("self-test passed");
+        return Ok(());
+    }
+    if report.needs_a_quiet_machine {
+        println!("this ran on an output, so anything else playing would land in the same figures");
+    }
+    bail!("self-test failed")
 }
 
 /// Whether audio flows through it, this meter's own tap excluded, or a dash

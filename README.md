@@ -106,6 +106,34 @@ report "running" to the very act of looking at it.
 cargo run --release --features gui --bin output-decibel-meter-gui
 ```
 
+## Checking a machine
+
+```sh
+output-decibel-meter --self-test
+```
+
+It plays a 1 kHz tone at a known level, meters it back, and prints what it read
+against what it played:
+
+```
+metering PipeWire ALSA [output-decibel-meter] — ALSA Playback
+  this process's own stream — anything else may keep playing
+
+  integrated loudness                  -20.0 LUFS  expected  -20.0 ± 0.5   ok
+  true peak                            -20.0 dBTP  expected  -20.0 ± 0.5   ok
+  drop when the source drops 6 dB        6.0 dB    expected    6.0 ± 0.5   ok
+```
+
+It meters *itself*: the tone is played by the process running the check and
+tapped at that process's own output, found in the graph by its process id. So
+nothing else has to stop — a video can keep playing and the figures do not move.
+Where programs cannot be tapped it falls back to the output, and then the
+machine does have to be quiet; it says which of the two it did.
+
+The third line is a difference rather than a level, which is what makes it true
+whatever the path does to the absolute gain: drop the source by 6 dB and the
+reading has to drop by 6 dB.
+
 ## As a library
 
 ```rust

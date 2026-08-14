@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use pipewire as pw;
+use pw::client::{Client, ClientListener};
 use pw::metadata::{Metadata, MetadataListener};
 use pw::node::{Node, NodeChangeMask, NodeListener};
 use pw::properties::properties;
@@ -74,6 +75,9 @@ pub struct GraphNode {
     pub serial: String,
     /// What kind of node this is.
     pub kind: Kind,
+    /// The process playing it, where the graph says so — programs carry it,
+    /// devices do not. What lets a program meter its own output.
+    pub pid: Option<u32>,
     /// True for the sink or the source the system currently defaults to.
     pub is_default: bool,
     /// True while a program is playing into it, taking from it, or — for a
@@ -219,6 +223,11 @@ fn follow(
     // answer to "is anything playing through this".
     let links: Rc<RefCell<HashMap<u32, (u32, u32)>>> = Rc::new(RefCell::new(HashMap::new()));
     let recorders: Rc<RefCell<HashMap<u32, Recorder>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Programs playing through the ALSA or Pulse compatibility layers get a
+    // node with no process id on it; their client carries one.
+    let clients: Rc<RefCell<HashMap<u32, u32>>> = Rc::new(RefCell::new(HashMap::new()));
+    let bound_clients: Rc<RefCell<HashMap<u32, (Client, ClientListener)>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     let watched: Rc<RefCell<Vec<(Metadata, MetadataListener)>>> = Rc::new(RefCell::new(Vec::new()));
 
     let publish = {
@@ -227,12 +236,14 @@ fn follow(
         let defaults = Rc::clone(&defaults);
         let links = Rc::clone(&links);
         let recorders = Rc::clone(&recorders);
+        let clients = Rc::clone(&clients);
         move || {
             let nodes = snapshot(
                 &found.borrow(),
                 &defaults.borrow(),
                 &links.borrow(),
                 &recorders.borrow(),
+                &clients.borrow(),
             );
             *seen.lock().unwrap_or_else(|e| e.into_inner()) = nodes;
         }
@@ -249,10 +260,40 @@ fn follow(
             let watched = Rc::clone(&watched);
             let links = Rc::clone(&links);
             let recorders = Rc::clone(&recorders);
+            let clients = Rc::clone(&clients);
+            let bound_clients = Rc::clone(&bound_clients);
             let publish = Rc::clone(&publish);
             move |global| {
                 match global.type_ {
                     pw::types::ObjectType::Node => {}
+                    pw::types::ObjectType::Client => {
+                        let Some(props) = global.props else { return };
+                        if let Some(pid) = pid_of(props) {
+                            clients.borrow_mut().insert(global.id, pid);
+                            publish();
+                            return;
+                        }
+                        // Not in the announcement, so ask the client itself.
+                        let Ok(client) = registry.bind::<Client, _>(global) else {
+                            return;
+                        };
+                        let id = global.id;
+                        let listener = client
+                            .add_listener_local()
+                            .info({
+                                let clients = Rc::clone(&clients);
+                                let publish = Rc::clone(&publish);
+                                move |info| {
+                                    let Some(props) = info.props() else { return };
+                                    let Some(pid) = pid_of(props) else { return };
+                                    clients.borrow_mut().insert(id, pid);
+                                    publish();
+                                }
+                            })
+                            .register();
+                        bound_clients.borrow_mut().insert(id, (client, listener));
+                        return;
+                    }
                     pw::types::ObjectType::Link => {
                         let Some(props) = global.props else { return };
                         let ends = (
@@ -331,6 +372,8 @@ fn follow(
                     kind,
                     // Only the node itself says so; the registry does not.
                     is_running: false,
+                    pid: pid_of(props),
+                    client: props.get("client.id").and_then(|c| c.parse().ok()),
                 };
 
                 // What the registry already knows, in case the node itself
@@ -382,6 +425,9 @@ fn follow(
                                     if let Some(node_name) = props.get("node.name") {
                                         known.node_name = node_name.to_string();
                                     }
+                                    if let Some(pid) = pid_of(props) {
+                                        known.pid = Some(pid);
+                                    }
                                 }
                             }
                             publish();
@@ -396,11 +442,15 @@ fn follow(
             let bound = Rc::clone(&bound);
             let links = Rc::clone(&links);
             let recorders = Rc::clone(&recorders);
+            let clients = Rc::clone(&clients);
+            let bound_clients = Rc::clone(&bound_clients);
             let publish = Rc::clone(&publish);
             move |id| {
                 let known = found.borrow_mut().remove(&id).is_some()
                     | links.borrow_mut().remove(&id).is_some()
-                    | recorders.borrow_mut().remove(&id).is_some();
+                    | recorders.borrow_mut().remove(&id).is_some()
+                    | clients.borrow_mut().remove(&id).is_some();
+                bound_clients.borrow_mut().remove(&id);
                 if known {
                     bound.borrow_mut().remove(&id);
                     publish();
@@ -430,6 +480,7 @@ fn snapshot(
     defaults: &Defaults,
     links: &HashMap<u32, (u32, u32)>,
     recorders: &HashMap<u32, Recorder>,
+    clients: &HashMap<u32, u32>,
 ) -> Vec<GraphNode> {
     let is_kind = |id: u32, kind: Kind| found.get(&id).is_some_and(|f| f.kind == kind);
     // A stream that exists is not a stream that plays: a paused tab keeps its
@@ -463,6 +514,11 @@ fn snapshot(
             name: f.name.clone(),
             serial: f.serial.clone(),
             kind: f.kind,
+            // The node's own process id when it has one, its client's
+            // otherwise — which is the only one an ALSA program has.
+            pid: f
+                .pid
+                .or_else(|| f.client.and_then(|c| clients.get(&c).copied())),
             is_default: match f.kind {
                 Kind::Sink => defaults.sink.as_deref() == Some(&f.node_name),
                 Kind::Source => defaults.source.as_deref() == Some(&f.node_name),
@@ -503,6 +559,10 @@ struct Found {
     serial: String,
     kind: Kind,
     is_running: bool,
+    pid: Option<u32>,
+    /// The client that opened it, which is where the process id lives when the
+    /// node itself does not carry one.
+    client: Option<u32>,
 }
 
 /// A recorder — anything capturing — as the graph announces it.
@@ -748,6 +808,11 @@ fn name_of(props: &DictRef, kind: Kind) -> Option<String> {
     (!name.is_empty()).then(|| shorten(&name))
 }
 
+/// The process a node belongs to, where it says.
+fn pid_of(props: &DictRef) -> Option<u32> {
+    props.get("application.process.id")?.parse().ok()
+}
+
 /// What to show until a node has said what it is called.
 fn unnamed(kind: Kind) -> &'static str {
     match kind {
@@ -777,6 +842,8 @@ mod tests {
             serial: "1".to_string(),
             kind,
             is_running,
+            pid: None,
+            client: None,
         }
     }
 
@@ -797,7 +864,13 @@ mod tests {
             .map(|(id, is_ours)| (*id, Recorder { is_ours: *is_ours }))
             .collect();
 
-        let snapshot = snapshot(&found, &Defaults::default(), &links, &recorders);
+        let snapshot = snapshot(
+            &found,
+            &Defaults::default(),
+            &links,
+            &recorders,
+            &HashMap::new(),
+        );
         nodes
             .iter()
             .map(|(_, f)| {

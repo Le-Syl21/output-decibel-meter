@@ -59,6 +59,8 @@ pub struct Source {
     /// Whether audio flows through it besides this meter, where the backend
     /// knows. `cpal` cannot tell, and answers `None`.
     pub is_active: Option<bool>,
+    /// The process playing it, for a program the graph could name one for.
+    pub pid: Option<u32>,
     handle: Handle,
 }
 
@@ -175,6 +177,7 @@ pub fn sources() -> Result<Vec<Source>> {
             mode: CaptureMode::Device,
             is_output: true,
             is_active: None,
+            pid: None,
             handle: Handle::Device(device),
         });
     }
@@ -189,6 +192,7 @@ pub fn sources() -> Result<Vec<Source>> {
             mode: CaptureMode::Device,
             is_output: false,
             is_active: None,
+            pid: None,
             handle: Handle::Device(device),
         });
     }
@@ -229,6 +233,7 @@ fn from_graph(node: crate::graph::GraphNode) -> Source {
         },
         is_output: node.kind != Kind::Source,
         is_active: Some(node.is_active),
+        pid: node.pid,
         handle: Handle::Graph {
             serial: node.serial,
             kind: node.kind,
@@ -254,6 +259,7 @@ pub fn default_output() -> Result<Source> {
         mode: CaptureMode::Device,
         is_output: true,
         is_active: None,
+        pid: None,
         handle: Handle::Device(device),
     })
 }
@@ -291,6 +297,8 @@ pub struct SourceInfo {
     pub is_output: bool,
     /// Whether audio flows through it besides this meter, where that is known.
     pub is_active: Option<bool>,
+    /// The process playing it, for a program the graph could name one for.
+    pub pid: Option<u32>,
     /// What [`by_key`] reopens it with.
     pub key: String,
 }
@@ -303,6 +311,7 @@ impl Source {
             mode: self.mode,
             is_output: self.is_output,
             is_active: self.is_active,
+            pid: self.pid,
             key: self.key(),
         }
     }
@@ -405,6 +414,18 @@ pub fn find(fragment: &str) -> Result<Source> {
         .into_iter()
         .find(|s| s.name.to_lowercase().contains(&wanted))
         .with_context(|| format!("no audio source matching {fragment:?}"))
+}
+
+/// Every stream a process is playing, newest listing first.
+///
+/// What lets a program meter *itself*: pass [`std::process::id`] and what comes
+/// back is its own output, tapped before the mix, whatever else the machine is
+/// playing at the same time. Empty where programs cannot be tapped.
+pub fn from_process(pid: u32) -> Result<Vec<Source>> {
+    Ok(sources()?
+        .into_iter()
+        .filter(|s| s.pid == Some(pid))
+        .collect())
 }
 
 /// Find the source a [`Source::key`] came from.

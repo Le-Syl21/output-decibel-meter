@@ -25,6 +25,7 @@ pub mod capture;
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 pub mod graph;
 pub mod meter;
+pub mod selftest;
 
 pub use capture::{CaptureMode, Source, sources};
 pub use meter::{Meter, Reading};

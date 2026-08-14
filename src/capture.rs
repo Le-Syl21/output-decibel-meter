@@ -77,6 +77,9 @@ enum Handle {
     /// A WASAPI endpoint, by its endpoint id. Outputs are opened in loopback.
     #[cfg(target_os = "windows")]
     Endpoint { id: String, loopback: bool },
+    /// A Core Audio process tap: everything, or one program.
+    #[cfg(target_os = "macos")]
+    Tap(crate::coreaudio::What),
 }
 
 impl std::fmt::Debug for Source {
@@ -112,6 +115,10 @@ enum Running {
     #[cfg(target_os = "windows")]
     Endpoint {
         _tap: crate::wasapi::Tap,
+    },
+    #[cfg(target_os = "macos")]
+    Tap {
+        _tap: crate::coreaudio::Tap,
     },
 }
 
@@ -164,6 +171,9 @@ pub fn sources() -> Result<Vec<Source>> {
     }
     if let Some(endpoints) = wasapi_sources() {
         return Ok(endpoints);
+    }
+    if let Some(taps) = tap_sources() {
+        return Ok(taps);
     }
     let host = cpal::default_host();
     let mut found: Vec<Source> = Vec::new();
@@ -492,6 +502,42 @@ fn wasapi_sources() -> Option<Vec<Source>> {
     None
 }
 
+/// What a Mac offers: the mix, tapped, plus its inputs through `cpal`.
+///
+/// There is one output entry rather than one per device, because a tap listens
+/// to what is *played*, not to a card — which is the same thing wherever the
+/// sound was going.
+#[cfg(target_os = "macos")]
+fn tap_sources() -> Option<Vec<Source>> {
+    let mut found = vec![Source {
+        name: "Everything this machine plays".to_string(),
+        mode: CaptureMode::Device,
+        is_output: true,
+        is_active: None,
+        pid: None,
+        handle: Handle::Tap(crate::coreaudio::What::Everything),
+    }];
+    // Inputs are ordinary devices here, so cpal handles them as it always did.
+    if let Ok(inputs) = cpal::default_host().input_devices() {
+        for device in inputs {
+            found.push(Source {
+                name: describe(&device),
+                mode: CaptureMode::Device,
+                is_output: false,
+                is_active: None,
+                pid: None,
+                handle: Handle::Device(device),
+            });
+        }
+    }
+    Some(found)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tap_sources() -> Option<Vec<Source>> {
+    None
+}
+
 /// Whether an output can be captured on this platform at all.
 ///
 /// Capturing an output means recording what it plays, and no platform does that
@@ -500,7 +546,11 @@ fn wasapi_sources() -> Option<Vec<Source>> {
 /// a Core Audio process tap, and `cpal` exposes neither. Asked anyway, macOS
 /// answers `Unknown property` from three layers down, which explains nothing.
 pub fn outputs_can_be_captured() -> bool {
-    cfg!(any(target_os = "linux", target_os = "windows"))
+    cfg!(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos"
+    ))
 }
 
 /// What to say when they cannot.
@@ -522,6 +572,20 @@ pub fn find(fragment: &str) -> Result<Source> {
 /// back is its own output, tapped before the mix, whatever else the machine is
 /// playing at the same time. Empty where programs cannot be tapped.
 pub fn from_process(pid: u32) -> Result<Vec<Source>> {
+    #[cfg(target_os = "macos")]
+    {
+        // Core Audio taps a process by id without any listing to go through,
+        // which is all this needs — and is how a program meters itself here.
+        return Ok(vec![Source {
+            name: format!("process {pid}"),
+            mode: CaptureMode::Application,
+            is_output: true,
+            is_active: None,
+            pid: Some(pid),
+            handle: Handle::Tap(crate::coreaudio::What::Process(pid)),
+        }]);
+    }
+    #[cfg(not(target_os = "macos"))]
     Ok(sources()?
         .into_iter()
         .filter(|s| s.pid == Some(pid))
@@ -548,6 +612,11 @@ impl Source {
             Handle::Graph { serial, .. } => format!("graph:{serial}"),
             #[cfg(target_os = "windows")]
             Handle::Endpoint { id, .. } => format!("endpoint:{id}"),
+            #[cfg(target_os = "macos")]
+            Handle::Tap(what) => match what {
+                crate::coreaudio::What::Everything => "tap:everything".to_string(),
+                crate::coreaudio::What::Process(pid) => format!("tap:{pid}"),
+            },
         }
     }
 
@@ -562,6 +631,17 @@ impl Source {
         )]
         let device = match &self.handle {
             Handle::Device(device) => device,
+            #[cfg(target_os = "macos")]
+            Handle::Tap(what) => {
+                let tapped = crate::coreaudio::open(*what)
+                    .with_context(|| format!("tapping {}", self.name))?;
+                return Ok(Capture {
+                    channels: tapped.channels,
+                    sample_rate: tapped.sample_rate,
+                    blocks: tapped.blocks,
+                    _running: Running::Tap { _tap: tapped.tap },
+                });
+            }
             #[cfg(target_os = "windows")]
             Handle::Endpoint { id, loopback } => {
                 let tapped = crate::wasapi::open(id, *loopback)

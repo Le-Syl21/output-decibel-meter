@@ -195,9 +195,7 @@ unsafe fn aggregate_around(tap_uid: &NSString) -> Result<AudioObjectID> {
 
         // NSDictionary and CFDictionary are the same object seen from two
         // languages, which is what "toll-free bridged" means.
-        let as_cf: &CFDictionary = &*(Retained::as_ptr(&description)
-            as *const NSDictionary<NSString, AnyObject>
-            as *const CFDictionary);
+        let as_cf: &CFDictionary = &*(Retained::as_ptr(&description) as *const CFDictionary);
 
         let mut aggregate: AudioObjectID = 0;
         let status = AudioHardwareCreateAggregateDevice(as_cf, NonNull::from(&mut aggregate));

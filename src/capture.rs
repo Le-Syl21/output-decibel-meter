@@ -167,6 +167,21 @@ pub fn sources() -> Result<Vec<Source>> {
             .any(|s| s.name == name && s.is_output == is_output)
     };
 
+    // The default output leads, and is never filtered out: whatever it is, it
+    // is what `default_output` hands back, and a source that cannot be found
+    // again in the listing cannot be reopened — a window would start on a
+    // source it could not name.
+    if let Some(device) = host.default_output_device() {
+        found.push(Source {
+            name: describe(&device),
+            mode: CaptureMode::Device,
+            is_output: true,
+            is_active: None,
+            pid: None,
+            handle: Handle::Device(device),
+        });
+    }
+
     for device in host.output_devices().context("listing output devices")? {
         let name = describe(&device);
         if is_alsa_plugin(&name) || already_listed(&found, &name, true) {

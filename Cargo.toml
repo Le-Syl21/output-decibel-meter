@@ -7,6 +7,8 @@ description = "Live loudness metering of what a program actually outputs — per
 repository = "https://github.com/Le-Syl21/output-decibel-meter"
 keywords = ["audio", "loudness", "ebu-r128", "metering", "loopback"]
 categories = ["multimedia::audio"]
+# Two binaries, so `cargo run` has to be told which one it is.
+default-run = "output-decibel-meter"
 
 [lib]
 name = "output_decibel_meter"

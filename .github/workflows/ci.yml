@@ -226,7 +226,7 @@ jobs:
           set -e
           case $status in
             0) echo "::notice::the tone check passed on ${{ matrix.label }}" ;;
-            2) echo "::notice::${{ matrix.label }} has no audio output; nothing was measured" ;;
+            2) echo "::notice::nothing could be measured on ${{ matrix.label }} — no audio, or no way to capture one; either way, not the code" ;;
             *) echo "::warning::the tone check failed on ${{ matrix.label }} with status $status — \
                      this one is about the code, not the runner" ;;
           esac

@@ -26,7 +26,8 @@ use objc2_core_audio::{
     kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceMainSubDeviceKey,
     kAudioAggregateDeviceNameKey, kAudioAggregateDeviceTapAutoStartKey,
     kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioDevicePropertyStreamFormat,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeInput, kAudioSubTapUIDKey,
+    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioSubTapUIDKey,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp};
 use objc2_core_foundation::CFDictionary;
@@ -94,7 +95,11 @@ pub fn open(what: What) -> Result<Tapped> {
                 &NSArray::new(),
             ),
             What::Process(pid) => {
-                let processes = NSArray::from_retained_slice(&[NSNumber::new_u32(pid)]);
+                // Not the Unix process id: a tap is described in terms of Core
+                // Audio's own objects, and a program that has never played has
+                // no such object at all.
+                let object = process_object(pid)?;
+                let processes = NSArray::from_retained_slice(&[NSNumber::new_u32(object)]);
                 CATapDescription::initStereoMixdownOfProcesses(
                     CATapDescription::alloc(),
                     &processes,
@@ -203,6 +208,38 @@ unsafe fn aggregate_around(tap_uid: &NSString) -> Result<AudioObjectID> {
             bail!("Core Audio would not wrap the tap in a device: status {status}");
         }
         Ok(aggregate)
+    }
+}
+
+/// The Core Audio object standing for a process, or nothing if it has none.
+///
+/// A process gets one when it first plays or records; asking about a program
+/// that has done neither is how `AudioHardwareCreateProcessTap` ends up
+/// answering "bad object" with nothing else to go on.
+pub fn process_object(pid: u32) -> Result<AudioObjectID> {
+    // The system object, which is where hardware-wide questions are asked.
+    const SYSTEM: AudioObjectID = 1;
+    unsafe {
+        let address = AudioObjectPropertyAddress {
+            mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let wanted = pid as i32;
+        let mut object: AudioObjectID = 0;
+        let mut size = std::mem::size_of_val(&object) as u32;
+        let status = AudioObjectGetPropertyData(
+            SYSTEM,
+            NonNull::from(&address),
+            std::mem::size_of_val(&wanted) as u32,
+            &wanted as *const i32 as *const c_void,
+            NonNull::from(&mut size),
+            NonNull::from(&mut object).cast::<c_void>(),
+        );
+        if status != 0 || object == 0 {
+            bail!("process {pid} has no audio of its own to tap (status {status})");
+        }
+        Ok(object)
     }
 }
 

@@ -2012,6 +2012,7 @@ dependencies = [
  "eframe",
  "egui",
  "pipewire",
+ "windows",
 ]
 
 [[package]]

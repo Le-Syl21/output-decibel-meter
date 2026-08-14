@@ -1,9 +1,9 @@
 # output-decibel-meter
 
 Live loudness metering of what a program actually outputs — per-application or
-per-device capture, reported as EBU R128 loudness and true peak. Linux today;
-Windows and macOS build and list, but cannot yet capture an output. Pure Rust,
-with an optional egui meter.
+per-device capture, reported as EBU R128 loudness and true peak. Linux through
+PipeWire, Windows through WASAPI loopback; macOS lists but cannot yet capture an
+output. Pure Rust, with an optional egui meter.
 
 ## Why
 
@@ -37,8 +37,9 @@ point it was taken at, and that point is not the same everywhere.
 | Mode | Platform | Captured at | System volume included |
 |---|---|---|---|
 | device | Linux | the monitor ports of a sink | **depends on the setup** |
+| device | Windows | WASAPI loopback of the render endpoint | no |
 | application | Linux | the program's own output ports | no |
-| either | Windows, macOS | *not yet* — see Status | — |
+| either | macOS | *not yet* — see Status | — |
 
 "Depends on the setup" is meant literally: a sink's monitor carries the system
 volume when the volume is applied in software, and does not when the card
@@ -151,8 +152,8 @@ while let Some(block) = capture.next_block(Duration::from_millis(200)) {
 # Ok::<(), anyhow::Error>(())
 ```
 
-The library pulls in `cpal` and `ebur128`, plus `pipewire` on Linux; `egui` only
-arrives with the `gui` feature.
+The library pulls in `cpal` and `ebur128`, plus `pipewire` on Linux and
+`windows` on Windows; `egui` only arrives with the `gui` feature.
 
 ## Status
 
@@ -169,18 +170,25 @@ play a −20 dBFS tone. Nothing in the numbers says so. Going through the graph
 removes the ambiguity, and incidentally lists each device once instead of once
 per access path.
 
-Windows and macOS build, list their devices and meter an *input*, and that is
-where it stops today — a correction the CI made, not a plan. Capturing an output
-is not "open it the other way round": Linux gets away with it because a sink's
-monitor is an ordinary input, while Windows needs WASAPI's loopback flag and
-macOS a Core Audio process tap, and `cpal` exposes neither. A runner with a
-virtual sound card answered `Unknown property` when asked, which is the whole
-story. The tools now say which platform it is and what it would take, rather
-than reporting an error from three layers down.
+Windows has its own backend now, for the reason the CI made plain: capturing an
+output is not "open it the other way round". `cpal` cannot do it, so this talks
+to WASAPI directly — endpoints enumerated through `IMMDeviceEnumerator`, an
+audio client initialised on the render endpoint with
+`AUDCLNT_STREAMFLAGS_LOOPBACK`, and `IAudioCaptureClient` pumped on its own
+thread. It is the same shape as the PipeWire backend and it replaces `cpal`
+there entirely.
 
-So the mechanisms are known and not written. The shape of the code is ready for
-them — something lists, something taps, everything above works on blocks of
-`f32` — and until they are, only Linux measures what leaves a machine.
+**It has never run against a real sound card.** It compiles for
+`x86_64-pc-windows-msvc`, clippy included, and the CI exercises it as far as a
+runner allows — which is not far, since GitHub's Windows images expose no audio
+endpoint at all. Treat the Windows path as written and unproven until someone
+runs `--self-test` on a machine with speakers; that is exactly what it is for,
+and what it prints will say whether the tone came back at the level it left.
+
+macOS is still device-loopback-less: it needs a Core Audio process tap
+(`AudioHardwareCreateProcessTap`, macOS 14.4+), which is not written. Asked for
+an output there, the tools say so and exit 2 rather than reporting `Unknown
+property` from inside CoreAudio.
 
 ## Building
 

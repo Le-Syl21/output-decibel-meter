@@ -3,7 +3,7 @@ name = "output-decibel-meter"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-description = "Live loudness metering of what a program actually outputs — per-application or per-device capture, reported as EBU R128 loudness and true peak. Linux today; Windows and macOS list but cannot yet capture an output."
+description = "Live loudness metering of what a program actually outputs — per-application or per-device capture, reported as EBU R128 loudness and true peak. Linux through PipeWire, Windows through WASAPI loopback; macOS lists but cannot yet capture an output."
 repository = "https://github.com/Le-Syl21/output-decibel-meter"
 keywords = ["audio", "loudness", "ebu-r128", "metering", "loopback"]
 categories = ["multimedia::audio"]
@@ -50,6 +50,18 @@ egui = { version = "0.36.1", optional = true }
 
 [lints.rust]
 missing_docs = "warn"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# WASAPI, for the loopback flag that turns an output into something recordable.
+# Pure Rust bindings, so no extra build dependency comes with it.
+windows = { version = "0.62.2", features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # v0_3_44 for `target.object`, which is what says *which* program to tap.

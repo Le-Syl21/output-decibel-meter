@@ -74,6 +74,9 @@ enum Handle {
         serial: String,
         kind: crate::graph::Kind,
     },
+    /// A WASAPI endpoint, by its endpoint id. Outputs are opened in loopback.
+    #[cfg(target_os = "windows")]
+    Endpoint { id: String, loopback: bool },
 }
 
 impl std::fmt::Debug for Source {
@@ -105,6 +108,10 @@ enum Running {
     #[cfg(all(target_os = "linux", feature = "pipewire"))]
     Graph {
         _tap: crate::graph::Tap,
+    },
+    #[cfg(target_os = "windows")]
+    Endpoint {
+        _tap: crate::wasapi::Tap,
     },
 }
 
@@ -154,6 +161,9 @@ fn is_alsa_plugin(_name: &str) -> bool {
 pub fn sources() -> Result<Vec<Source>> {
     if let Some(graph) = graph_sources() {
         return Ok(graph);
+    }
+    if let Some(endpoints) = wasapi_sources() {
+        return Ok(endpoints);
     }
     let host = cpal::default_host();
     let mut found: Vec<Source> = Vec::new();
@@ -264,6 +274,9 @@ fn graph_sources() -> Option<Vec<Source>> {
 /// The system's default output, captured in loopback.
 pub fn default_output() -> Result<Source> {
     if let Some(default) = graph_default_output() {
+        return Ok(default);
+    }
+    if let Some(default) = wasapi_default_output() {
         return Ok(default);
     }
     let device = cpal::default_host()
@@ -422,6 +435,63 @@ fn listed() -> Vec<SourceInfo> {
         .unwrap_or_default()
 }
 
+/// What WASAPI offers, on the platform where it is the only way in.
+///
+/// Preferred over `cpal` there for the reason the whole module exists: an
+/// output has to be opened with the loopback flag, which no portable API sets.
+#[cfg(target_os = "windows")]
+fn wasapi_sources() -> Option<Vec<Source>> {
+    let endpoints = match crate::wasapi::endpoints() {
+        Ok(endpoints) if !endpoints.is_empty() => endpoints,
+        Ok(_) => return None,
+        Err(e) => {
+            eprintln!("falling back to device listing: {e:#}");
+            return None;
+        }
+    };
+    Some(endpoints.into_iter().map(from_endpoint).collect())
+}
+
+/// An endpoint as a source.
+#[cfg(target_os = "windows")]
+fn from_endpoint(endpoint: crate::wasapi::Endpoint) -> Source {
+    Source {
+        name: endpoint.name,
+        mode: CaptureMode::Device,
+        is_output: endpoint.is_output,
+        // WASAPI can be asked what an endpoint is doing, but only as a peak
+        // sampled right now, which would flicker between listings.
+        is_active: None,
+        pid: None,
+        handle: Handle::Endpoint {
+            loopback: endpoint.is_output,
+            id: endpoint.id,
+        },
+    }
+}
+
+/// The endpoint the system plays through, as WASAPI reports it.
+#[cfg(target_os = "windows")]
+fn wasapi_default_output() -> Option<Source> {
+    let endpoints = crate::wasapi::endpoints().ok()?;
+    let outputs = || endpoints.iter().filter(|e| e.is_output);
+    // No default declared is no reason to give up: any output beats none.
+    let chosen = outputs()
+        .find(|e| e.is_default)
+        .or_else(|| outputs().next())?;
+    Some(from_endpoint(chosen.clone()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wasapi_default_output() -> Option<Source> {
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wasapi_sources() -> Option<Vec<Source>> {
+    None
+}
+
 /// Whether an output can be captured on this platform at all.
 ///
 /// Capturing an output means recording what it plays, and no platform does that
@@ -430,13 +500,12 @@ fn listed() -> Vec<SourceInfo> {
 /// a Core Audio process tap, and `cpal` exposes neither. Asked anyway, macOS
 /// answers `Unknown property` from three layers down, which explains nothing.
 pub fn outputs_can_be_captured() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(any(target_os = "linux", target_os = "windows"))
 }
 
 /// What to say when they cannot.
 pub const WHY_NOT_OUTPUTS: &str = "capturing an output is not implemented on this platform yet — \
-     it needs WASAPI loopback on Windows and a Core Audio process tap on macOS, \
-     neither of which cpal exposes";
+     macOS needs a Core Audio process tap, which cpal does not expose";
 
 /// Find a source whose name contains `fragment`, case-insensitively.
 pub fn find(fragment: &str) -> Result<Source> {
@@ -477,6 +546,8 @@ impl Source {
             Handle::Device(_) => format!("device:{}:{}", self.is_output, self.name),
             #[cfg(all(target_os = "linux", feature = "pipewire"))]
             Handle::Graph { serial, .. } => format!("graph:{serial}"),
+            #[cfg(target_os = "windows")]
+            Handle::Endpoint { id, .. } => format!("endpoint:{id}"),
         }
     }
 
@@ -491,6 +562,17 @@ impl Source {
         )]
         let device = match &self.handle {
             Handle::Device(device) => device,
+            #[cfg(target_os = "windows")]
+            Handle::Endpoint { id, loopback } => {
+                let tapped = crate::wasapi::open(id, *loopback)
+                    .with_context(|| format!("tapping {}", self.name))?;
+                return Ok(Capture {
+                    channels: tapped.channels,
+                    sample_rate: tapped.sample_rate,
+                    blocks: tapped.blocks,
+                    _running: Running::Endpoint { _tap: tapped.tap },
+                });
+            }
             #[cfg(all(target_os = "linux", feature = "pipewire"))]
             Handle::Graph { serial, kind } => {
                 let tapped = crate::graph::open(serial, *kind)

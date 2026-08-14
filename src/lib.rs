@@ -13,8 +13,9 @@
 //!   volume, which makes readings comparable between machines.
 //!
 //! On Linux both go through PipeWire, where what plays is a node in a graph and
-//! a meter is a node linked to it. On Windows and macOS, `cpal` provides device
-//! loopback and no program can be tapped yet.
+//! a meter is a node linked to it. Windows captures an output through WASAPI's
+//! loopback flag, and taps no programs yet. macOS can do neither: it needs a
+//! Core Audio process tap, which is not written.
 //!
 //! Everything is reported on two scales, both referenced to digital full scale
 //! and therefore negative: **LUFS** for perceived loudness, gated as EBU R128
@@ -26,6 +27,8 @@ pub mod capture;
 pub mod graph;
 pub mod meter;
 pub mod selftest;
+#[cfg(target_os = "windows")]
+pub mod wasapi;
 
 pub use capture::{CaptureMode, Source, sources};
 pub use meter::{Meter, Reading};

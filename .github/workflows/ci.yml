@@ -67,6 +67,13 @@ jobs:
       - name: Clippy (device capture alone)
         run: cargo clippy --release --no-default-features --all-targets -- -D warnings
 
+      # The Windows backend is native code nobody here can run, so the least it
+      # gets is the same lint gate as everything else, on every push.
+      - name: Clippy (the Windows backend)
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          cargo clippy --release --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+
   # A runner has no sound card, so one is made: PipeWire with a null sink is a
   # complete audio server, and a tone played into it comes back through the same
   # path a desktop would use. Without this job nothing ever proves that the tap

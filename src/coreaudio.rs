@@ -104,7 +104,7 @@ pub fn open(what: What) -> Result<Tapped> {
         description.setName(&NSString::from_str("output-decibel-meter"));
 
         let mut tap: AudioObjectID = 0;
-        let status = AudioHardwareCreateProcessTap(Some(&description), NonNull::from(&mut tap));
+        let status = AudioHardwareCreateProcessTap(Some(&description), &mut tap);
         if status != 0 {
             bail!("Core Audio would not create a process tap: status {status}");
         }

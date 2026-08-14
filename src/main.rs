@@ -73,7 +73,14 @@ fn main() -> Result<()> {
 
     let mut shown = 0.0;
     let mut last = Default::default();
+    // Wall clock, not measured seconds: a source that hands over nothing would
+    // otherwise keep --seconds waiting for ever, which is what it did.
+    let started = std::time::Instant::now();
+    let limit = cli.seconds.map(Duration::from_secs_f64);
     while !stop.load(Ordering::Relaxed) {
+        if limit.is_some_and(|limit| started.elapsed() >= limit) {
+            break;
+        }
         let Some(block) = capture.next_block(Duration::from_millis(200)) else {
             continue;
         };
@@ -91,6 +98,15 @@ fn main() -> Result<()> {
         if cli.seconds.is_some_and(|limit| last.seconds >= limit) {
             break;
         }
+    }
+
+    if last.seconds == 0.0 {
+        println!();
+        bail!(
+            "{} handed over no audio at all in {:.1} s",
+            source.name,
+            started.elapsed().as_secs_f64()
+        );
     }
 
     println!("\nover {:.1} s", last.seconds);

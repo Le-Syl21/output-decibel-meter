@@ -488,6 +488,21 @@ impl Source {
             }
         };
 
+        // Capturing an output means recording what it plays, which no platform
+        // does through the same call. Linux exposes a sink's monitor as an
+        // ordinary input, so opening it works; Windows wants WASAPI's loopback
+        // flag and macOS a process tap, and `cpal` offers neither. Saying so
+        // beats the "Unknown property" the OS answers when asked anyway.
+        if self.is_output && device.default_input_config().is_err() {
+            bail!(
+                "{} is an output, and capturing one is not implemented on {} yet: \
+                 it needs WASAPI loopback on Windows and a Core Audio process tap \
+                 on macOS, neither of which cpal exposes",
+                self.name,
+                std::env::consts::OS
+            );
+        }
+
         let supported = if self.is_output {
             device.default_output_config()
         } else {

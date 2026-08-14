@@ -1,8 +1,9 @@
 # output-decibel-meter
 
 Live loudness metering of what a program actually outputs — per-application or
-per-device capture on Linux, Windows and macOS, reported as EBU R128 loudness
-and true peak. Pure Rust, with an optional egui meter.
+per-device capture, reported as EBU R128 loudness and true peak. Linux today;
+Windows and macOS build and list, but cannot yet capture an output. Pure Rust,
+with an optional egui meter.
 
 ## Why
 
@@ -35,10 +36,9 @@ point it was taken at, and that point is not the same everywhere.
 
 | Mode | Platform | Captured at | System volume included |
 |---|---|---|---|
-| device | Windows | WASAPI loopback of the render mix | no |
-| device | macOS | Core Audio process tap | no |
 | device | Linux | the monitor ports of a sink | **depends on the setup** |
 | application | Linux | the program's own output ports | no |
+| either | Windows, macOS | *not yet* — see Status | — |
 
 "Depends on the setup" is meant literally: a sink's monitor carries the system
 volume when the volume is applied in software, and does not when the card
@@ -169,10 +169,18 @@ play a −20 dBFS tone. Nothing in the numbers says so. Going through the graph
 removes the ambiguity, and incidentally lists each device once instead of once
 per access path.
 
-Windows and macOS use device loopback through `cpal`, which is right there, and
-list no programs yet. The mechanisms exist — WASAPI process loopback, Core Audio
-process taps — and the shape of the code is ready for them: something lists,
-something taps, everything above works on blocks of `f32`.
+Windows and macOS build, list their devices and meter an *input*, and that is
+where it stops today — a correction the CI made, not a plan. Capturing an output
+is not "open it the other way round": Linux gets away with it because a sink's
+monitor is an ordinary input, while Windows needs WASAPI's loopback flag and
+macOS a Core Audio process tap, and `cpal` exposes neither. A runner with a
+virtual sound card answered `Unknown property` when asked, which is the whole
+story. The tools now say which platform it is and what it would take, rather
+than reporting an error from three layers down.
+
+So the mechanisms are known and not written. The shape of the code is ready for
+them — something lists, something taps, everything above works on blocks of
+`f32` — and until they are, only Linux measures what leaves a machine.
 
 ## Building
 

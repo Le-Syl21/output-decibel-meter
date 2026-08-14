@@ -1,3 +1,7 @@
+// A window, not a command: on Windows a console behind it is noise. Debug
+// builds keep it, since that is where println is how one looks inside.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! The meter window: pick a source, watch the level, reset when comparing.
 
 use std::collections::VecDeque;
@@ -408,16 +412,17 @@ impl eframe::App for MeterApp {
             // numbers that differ only by how long they look back are three
             // numbers one cannot read without knowing that.
             let since_reset = format!("{:.1} s, since reset", reading.seconds);
+            // Two by two rather than four deep: the figures are read as pairs
+            // anyway — the two that follow the action, then the two that keep
+            // score — and the two lines saved go to the source table.
             egui::Grid::new("figures")
-                .num_columns(3)
+                .num_columns(6)
                 .spacing([18.0, 4.0])
                 .show(ui, |ui| {
                     figure(ui, "momentary", reading.momentary, "LUFS", "400 ms");
-                    ui.end_row();
-                    figure(ui, "short term", reading.short_term, "LUFS", "3 s");
-                    ui.end_row();
                     figure(ui, "integrated", reading.integrated, "LUFS", &since_reset);
                     ui.end_row();
+                    figure(ui, "short term", reading.short_term, "LUFS", "3 s");
                     figure(ui, "true peak", reading.true_peak, "dBTP", &since_reset);
                     ui.end_row();
                 });
@@ -535,11 +540,103 @@ fn draw_history(ui: &mut egui::Ui, history: &[(f32, f32)]) {
     ));
 }
 
+/// The window icon: a VU meter, drawn rather than shipped.
+///
+/// Arithmetic instead of a PNG in the repository, and it comes out right at
+/// whatever size the desktop asks for. The look is the classic one — cream
+/// face, black scale, red over the loud third, needle a little past the middle
+/// — because that is what reads as "a meter" at sixteen pixels.
+fn icon() -> egui::IconData {
+    const SIZE: usize = 64;
+    const SUPER: usize = 3;
+    const FACE: [f32; 3] = [0.94, 0.90, 0.80];
+    const INK: [f32; 3] = [0.11, 0.11, 0.10];
+    const RED: [f32; 3] = [0.76, 0.20, 0.16];
+
+    // The scale is an arc swept either side of vertical, around a pivot sitting
+    // low on the face — a needle hinged at the bottom, as on the real thing.
+    let pivot = (0.5_f32, 0.80_f32);
+    let radius = 0.54_f32;
+    let sweep = 52.0_f32.to_radians();
+    let needle_at = 17.0_f32.to_radians();
+    let ticks: [f32; 7] = [-1.0, -0.66, -0.33, 0.0, 0.33, 0.66, 1.0];
+
+    /// Signed distance to a rounded rectangle: negative inside.
+    fn rounded(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> f32 {
+        let cx = px.clamp(x0 + r, x1 - r);
+        let cy = py.clamp(y0 + r, y1 - r);
+        ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() - r
+    }
+
+    let mut rgba = Vec::with_capacity(SIZE * SIZE * 4);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            // Supersampled, so the arc and the needle come out smooth.
+            let mut sum = [0.0_f32; 4];
+            for sy in 0..SUPER {
+                for sx in 0..SUPER {
+                    let px = (x as f32 + (sx as f32 + 0.5) / SUPER as f32) / SIZE as f32;
+                    let py = (y as f32 + (sy as f32 + 0.5) / SIZE as f32) / SIZE as f32;
+
+                    let face = rounded(px, py, 0.06, 0.12, 0.94, 0.88, 0.10);
+                    let (dx, dy) = (px - pivot.0, py - pivot.1);
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    let angle = dx.atan2(-dy);
+                    let on_scale = angle.abs() < sweep;
+                    // Everything past two thirds of the sweep is the loud part.
+                    let hot = angle > sweep * 0.34;
+
+                    let on_arc = on_scale && (distance - radius).abs() < 0.030;
+                    let on_tick = on_scale
+                        && (radius - 0.10..radius - 0.03).contains(&distance)
+                        && ticks
+                            .iter()
+                            .any(|t| (angle - t * sweep).abs() < 0.030 / distance.max(0.1));
+
+                    // The needle, as a segment from the hub outwards.
+                    let (nx, ny) = (needle_at.sin(), -needle_at.cos());
+                    let along = (dx * nx + dy * ny).clamp(0.0, radius - 0.09);
+                    let to_needle = ((dx - nx * along).powi(2) + (dy - ny * along).powi(2)).sqrt();
+                    let on_needle = to_needle < 0.020 || distance < 0.045;
+
+                    let colour = if face > 0.0 {
+                        [0.0, 0.0, 0.0, 0.0]
+                    } else if face > -0.022 {
+                        // A rim, so the face has an edge on a light desktop too.
+                        [INK[0], INK[1], INK[2], 1.0]
+                    } else if on_needle {
+                        [INK[0], INK[1], INK[2], 1.0]
+                    } else if on_arc || on_tick {
+                        let c = if hot { RED } else { INK };
+                        [c[0], c[1], c[2], 1.0]
+                    } else {
+                        [FACE[0], FACE[1], FACE[2], 1.0]
+                    };
+                    for (slot, value) in sum.iter_mut().zip(colour) {
+                        *slot += value;
+                    }
+                }
+            }
+            let samples = (SUPER * SUPER) as f32;
+            for channel in sum {
+                rgba.push(((channel / samples) * 255.0).round().clamp(0.0, 255.0) as u8);
+            }
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: SIZE as u32,
+        height: SIZE as u32,
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([840.0, 780.0])
             .with_min_inner_size([620.0, 600.0])
+            .with_icon(icon())
             .with_title("Output decibel meter"),
         ..Default::default()
     };

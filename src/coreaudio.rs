@@ -10,13 +10,14 @@
 //! plays, and one program by its process id. The second is what makes a program
 //! able to meter itself here as it does on Linux.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
 
 use anyhow::{Result, bail};
+use objc2::AllocAnyThread;
 use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
 use objc2_core_audio::{
     AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID, AudioDeviceIOProcID, AudioDeviceStart,
     AudioDeviceStop, AudioHardwareCreateAggregateDevice, AudioHardwareCreateProcessTap,
@@ -27,7 +28,8 @@ use objc2_core_audio::{
     kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioDevicePropertyStreamFormat,
     kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeInput, kAudioSubTapUIDKey,
 };
-use objc2_core_audio_types::AudioBufferList;
+use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp};
+use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSUUID};
 
 /// What a tap should listen to.
@@ -58,7 +60,6 @@ pub struct Tap {
     io_proc: AudioDeviceIOProcID,
     // The channel the callback sends through, freed only after it has stopped.
     sender: *mut Sender<Vec<f32>>,
-    stopped: Arc<AtomicBool>,
 }
 
 // The pointer is only ever touched by the callback, which stops before the
@@ -67,7 +68,6 @@ unsafe impl Send for Tap {}
 
 impl Drop for Tap {
     fn drop(&mut self) {
-        self.stopped.store(true, Ordering::Relaxed);
         unsafe {
             if self.io_proc.is_some() {
                 AudioDeviceStop(self.aggregate, self.io_proc);
@@ -104,7 +104,7 @@ pub fn open(what: What) -> Result<Tapped> {
         description.setName(&NSString::from_str("output-decibel-meter"));
 
         let mut tap: AudioObjectID = 0;
-        let status = AudioHardwareCreateProcessTap(Some(&description), &mut tap);
+        let status = AudioHardwareCreateProcessTap(Some(&description), NonNull::from(&mut tap));
         if status != 0 {
             bail!("Core Audio would not create a process tap: status {status}");
         }
@@ -134,8 +134,8 @@ pub fn open(what: What) -> Result<Tapped> {
         let status = AudioDeviceCreateIOProcID(
             aggregate,
             Some(deliver),
-            sender as *mut std::ffi::c_void,
-            &mut io_proc,
+            sender as *mut c_void,
+            NonNull::from(&mut io_proc),
         );
         if status != 0 {
             drop(Box::from_raw(sender));
@@ -149,7 +149,6 @@ pub fn open(what: What) -> Result<Tapped> {
             tap,
             io_proc,
             sender,
-            stopped: Arc::new(AtomicBool::new(false)),
         };
 
         let status = AudioDeviceStart(aggregate, io_proc);
@@ -169,48 +168,39 @@ pub fn open(what: What) -> Result<Tapped> {
 /// Build the private aggregate device that makes a tap readable.
 unsafe fn aggregate_around(tap_uid: &NSString) -> Result<AudioObjectID> {
     unsafe {
-        let sub_tap = NSDictionary::from_retained_objects(
-            &[NSString::from_str(
-                std::str::from_utf8(kAudioSubTapUIDKey.to_bytes()).unwrap_or("uid"),
-            )
-            .as_ref()],
-            &[Retained::from(tap_uid)],
-        );
-
-        let name = key(kAudioAggregateDeviceNameKey);
-        let uid = key(kAudioAggregateDeviceUIDKey);
-        let private = key(kAudioAggregateDeviceIsPrivateKey);
-        let auto_start = key(kAudioAggregateDeviceTapAutoStartKey);
-        let tap_list = key(kAudioAggregateDeviceTapListKey);
-        let main = key(kAudioAggregateDeviceMainSubDeviceKey);
-
-        let description: Retained<NSDictionary<NSString, objc2::runtime::AnyObject>> =
+        let sub_tap: Retained<NSDictionary<NSString, AnyObject>> =
             NSDictionary::from_retained_objects(
-                &[
-                    name.as_ref(),
-                    uid.as_ref(),
-                    private.as_ref(),
-                    auto_start.as_ref(),
-                    tap_list.as_ref(),
-                    main.as_ref(),
-                ],
-                &[
-                    Retained::into_super(NSString::from_str("output-decibel-meter tap")),
-                    Retained::into_super(NSString::from_str(
-                        &NSUUID::new().UUIDString().to_string(),
-                    )),
-                    Retained::into_super(NSNumber::new_bool(true)),
-                    Retained::into_super(NSNumber::new_bool(true)),
-                    Retained::into_super(NSArray::from_retained_slice(&[sub_tap])),
-                    Retained::into_super(NSString::from_str("")),
-                ],
+                &[&*key(kAudioSubTapUIDKey)],
+                &[Retained::into_super(tap_uid.copy())],
             );
 
+        let keys = [
+            key(kAudioAggregateDeviceNameKey),
+            key(kAudioAggregateDeviceUIDKey),
+            key(kAudioAggregateDeviceIsPrivateKey),
+            key(kAudioAggregateDeviceTapAutoStartKey),
+            key(kAudioAggregateDeviceTapListKey),
+            key(kAudioAggregateDeviceMainSubDeviceKey),
+        ];
+        let values: [Retained<AnyObject>; 6] = [
+            Retained::into_super(NSString::from_str("output-decibel-meter tap")),
+            Retained::into_super(NSUUID::new().UUIDString()),
+            Retained::into_super(NSNumber::new_bool(true)),
+            Retained::into_super(NSNumber::new_bool(true)),
+            Retained::into_super(NSArray::from_retained_slice(&[sub_tap])),
+            Retained::into_super(NSString::from_str("")),
+        ];
+        let description: Retained<NSDictionary<NSString, AnyObject>> =
+            NSDictionary::from_retained_objects(&keys.each_ref().map(|k| &**k), &values);
+
+        // NSDictionary and CFDictionary are the same object seen from two
+        // languages, which is what "toll-free bridged" means.
+        let as_cf: &CFDictionary = &*(Retained::as_ptr(&description)
+            as *const NSDictionary<NSString, AnyObject>
+            as *const CFDictionary);
+
         let mut aggregate: AudioObjectID = 0;
-        let status = AudioHardwareCreateAggregateDevice(
-            description.as_ref() as *const _ as *const _,
-            &mut aggregate,
-        );
+        let status = AudioHardwareCreateAggregateDevice(as_cf, NonNull::from(&mut aggregate));
         if status != 0 {
             bail!("Core Audio would not wrap the tap in a device: status {status}");
         }
@@ -224,24 +214,22 @@ fn key(raw: &'static std::ffi::CStr) -> Retained<NSString> {
 }
 
 /// The format the aggregate hands its input over in.
-unsafe fn stream_format(
-    device: AudioObjectID,
-) -> Result<objc2_core_audio_types::AudioStreamBasicDescription> {
+unsafe fn stream_format(device: AudioObjectID) -> Result<AudioStreamBasicDescription> {
     unsafe {
         let address = AudioObjectPropertyAddress {
             mSelector: kAudioDevicePropertyStreamFormat,
             mScope: kAudioObjectPropertyScopeInput,
             mElement: kAudioObjectPropertyElementMain,
         };
-        let mut format = objc2_core_audio_types::AudioStreamBasicDescription::default();
+        let mut format: AudioStreamBasicDescription = std::mem::zeroed();
         let mut size = std::mem::size_of_val(&format) as u32;
         let status = AudioObjectGetPropertyData(
             device,
-            &address,
+            NonNull::from(&address),
             0,
             std::ptr::null(),
-            &mut size,
-            &mut format as *mut _ as *mut std::ffi::c_void,
+            NonNull::from(&mut size),
+            NonNull::from(&mut format).cast::<c_void>(),
         );
         if status != 0 {
             bail!("the tap would not say what format it delivers: status {status}");
@@ -259,19 +247,19 @@ unsafe fn stream_format(
 /// under a deadline that dropping would be heard as a glitch.
 unsafe extern "C-unwind" fn deliver(
     _device: AudioObjectID,
-    _now: *const objc2_core_audio_types::AudioTimeStamp,
-    input: *const AudioBufferList,
-    _input_time: *const objc2_core_audio_types::AudioTimeStamp,
-    _output: *mut AudioBufferList,
-    _output_time: *const objc2_core_audio_types::AudioTimeStamp,
-    context: *mut std::ffi::c_void,
+    _now: NonNull<AudioTimeStamp>,
+    input: NonNull<AudioBufferList>,
+    _input_time: NonNull<AudioTimeStamp>,
+    _output: NonNull<AudioBufferList>,
+    _output_time: NonNull<AudioTimeStamp>,
+    context: *mut c_void,
 ) -> i32 {
     unsafe {
-        if input.is_null() || context.is_null() {
+        if context.is_null() {
             return 0;
         }
         let sender = &*(context as *const Sender<Vec<f32>>);
-        let list = &*input;
+        let list = input.as_ref();
         let count = list.mNumberBuffers as usize;
         let buffers = std::slice::from_raw_parts(list.mBuffers.as_ptr(), count);
 
@@ -288,6 +276,3 @@ unsafe extern "C-unwind" fn deliver(
         0
     }
 }
-
-/// How long a caller should be prepared to wait for the first block.
-pub const FIRST_BLOCK: Duration = Duration::from_secs(2);

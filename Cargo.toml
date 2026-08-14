@@ -51,6 +51,14 @@ egui = { version = "0.36.1", optional = true }
 [lints.rust]
 missing_docs = "warn"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Core Audio process taps, the only way to record what a Mac plays. macOS 14.4
+# and later; older systems get the same "not here" answer as before.
+objc2 = "0.6"
+objc2-core-audio = "0.3.2"
+objc2-core-audio-types = "0.3.2"
+objc2-foundation = "0.3"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 # WASAPI, for the loopback flag that turns an output into something recordable.
 # Pure Rust bindings, so no extra build dependency comes with it.

@@ -23,6 +23,8 @@
 //! clips.
 
 pub mod capture;
+#[cfg(target_os = "macos")]
+pub mod coreaudio;
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 pub mod graph;
 pub mod meter;

@@ -182,6 +182,9 @@ pub fn open(what: What) -> Result<Tapped> {
         if status != 0 {
             bail!("Core Audio would not start the tap: status {status}");
         }
+        // Everything above can succeed and still deliver nothing: a tap needs
+        // the audio-recording permission, and a machine that never granted it
+        // simply never calls back. See `delivery`, and the note callers print.
 
         Ok(Tapped {
             channels: format.mChannelsPerFrame,

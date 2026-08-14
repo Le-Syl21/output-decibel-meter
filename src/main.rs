@@ -198,6 +198,13 @@ fn report_delivery() {
     {
         let (calls, buffers, samples) = output_decibel_meter::coreaudio::delivery();
         println!("the tap callback ran {calls} times, over {buffers} buffers, {samples} samples");
+        if calls == 0 {
+            println!();
+            println!("Core Audio accepted the tap and then never called back, which on macOS");
+            println!("almost always means the audio-recording permission was never granted:");
+            println!("System Settings ▸ Privacy & Security ▸ Audio Recording. A command-line");
+            println!("binary with no bundle often cannot even ask. It also needs macOS 14.4.");
+        }
     }
 }
 

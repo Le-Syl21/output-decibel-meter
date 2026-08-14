@@ -38,8 +38,10 @@ point it was taken at, and that point is not the same everywhere.
 |---|---|---|---|
 | device | Linux | the monitor ports of a sink | **depends on the setup** |
 | device | Windows | WASAPI loopback of the render endpoint | no |
+| device | macOS | a Core Audio process tap on everything played | no |
+| application | macOS | a process tap on that program | no |
 | application | Linux | the program's own output ports | no |
-| either | macOS | *not yet* — see Status | — |
+
 
 "Depends on the setup" is meant literally: a sink's monitor carries the system
 volume when the volume is applied in software, and does not when the card
@@ -185,10 +187,19 @@ endpoint at all. Treat the Windows path as written and unproven until someone
 runs `--self-test` on a machine with speakers; that is exactly what it is for,
 and what it prints will say whether the tone came back at the level it left.
 
-macOS is still device-loopback-less: it needs a Core Audio process tap
-(`AudioHardwareCreateProcessTap`, macOS 14.4+), which is not written. Asked for
-an output there, the tools say so and exit 2 rather than reporting `Unknown
-property` from inside CoreAudio.
+macOS has a backend too, and it is the least proven of the three. A Core Audio
+process tap (macOS 14.4+) wrapped in a private aggregate device gives both modes
+— everything the machine plays, and one program by its process id — and on a CI
+runner every step of it succeeds: the tap is created, the aggregate is created,
+the format is negotiated, the IOProc starts. And then the callback never runs,
+not once, for either mode. That is the signature of the audio-recording
+permission never having been granted, which a headless runner cannot grant and a
+bundle-less command-line binary often cannot even ask for. `--self-test` prints
+the callback count and says as much when it is zero.
+
+So: Linux is measured and proven, Windows is written and unproven, macOS is
+written and known not to deliver on a machine that has not granted permission.
+The way to settle the last two is to run `--self-test` on a real one.
 
 ## Building
 

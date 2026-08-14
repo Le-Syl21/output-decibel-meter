@@ -572,19 +572,18 @@ pub fn find(fragment: &str) -> Result<Source> {
 /// back is its own output, tapped before the mix, whatever else the machine is
 /// playing at the same time. Empty where programs cannot be tapped.
 pub fn from_process(pid: u32) -> Result<Vec<Source>> {
+    // Core Audio taps a process by id without any listing to go through, which
+    // is all this needs — and is how a program meters itself there.
     #[cfg(target_os = "macos")]
-    {
-        // Core Audio taps a process by id without any listing to go through,
-        // which is all this needs — and is how a program meters itself here.
-        return Ok(vec![Source {
-            name: format!("process {pid}"),
-            mode: CaptureMode::Application,
-            is_output: true,
-            is_active: None,
-            pid: Some(pid),
-            handle: Handle::Tap(crate::coreaudio::What::Process(pid)),
-        }]);
-    }
+    return Ok(vec![Source {
+        name: format!("process {pid}"),
+        mode: CaptureMode::Application,
+        is_output: true,
+        is_active: None,
+        pid: Some(pid),
+        handle: Handle::Tap(crate::coreaudio::What::Process(pid)),
+    }]);
+
     #[cfg(not(target_os = "macos"))]
     Ok(sources()?
         .into_iter()

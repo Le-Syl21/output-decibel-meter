@@ -289,6 +289,9 @@ pub fn default_output() -> Result<Source> {
     if let Some(default) = wasapi_default_output() {
         return Ok(default);
     }
+    if let Some(default) = tap_default_output() {
+        return Ok(default);
+    }
     let device = cpal::default_host()
         .default_output_device()
         .context("this machine reports no default output device")?;
@@ -535,6 +538,20 @@ fn tap_sources() -> Option<Vec<Source>> {
 
 #[cfg(not(target_os = "macos"))]
 fn tap_sources() -> Option<Vec<Source>> {
+    None
+}
+
+/// What a Mac defaults to: the tap on everything, since that is its one output.
+///
+/// It has to be the very source the listing offers, or a window would start on
+/// something it could not then find again.
+#[cfg(target_os = "macos")]
+fn tap_default_output() -> Option<Source> {
+    tap_sources()?.into_iter().find(|s| s.is_output)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tap_default_output() -> Option<Source> {
     None
 }
 

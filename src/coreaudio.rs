@@ -24,10 +24,12 @@ use objc2_core_audio::{
     AudioHardwareDestroyAggregateDevice, AudioHardwareDestroyProcessTap,
     AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress, CATapDescription,
     kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceMainSubDeviceKey,
-    kAudioAggregateDeviceNameKey, kAudioAggregateDeviceTapAutoStartKey,
-    kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioDevicePropertyStreamFormat,
-    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioSubTapUIDKey,
+    kAudioAggregateDeviceNameKey, kAudioAggregateDeviceSubDeviceListKey,
+    kAudioAggregateDeviceTapAutoStartKey, kAudioAggregateDeviceTapListKey,
+    kAudioAggregateDeviceUIDKey, kAudioDevicePropertyDeviceUID, kAudioDevicePropertyStreamFormat,
+    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyTranslatePIDToProcessObject,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeInput, kAudioSubDeviceUIDKey, kAudioSubTapUIDKey,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp};
 use objc2_core_foundation::CFDictionary;
@@ -179,21 +181,34 @@ unsafe fn aggregate_around(tap_uid: &NSString) -> Result<AudioObjectID> {
                 &[Retained::into_super(NSString::from_str(&tap_uid.to_string())).into()],
             );
 
+        // An aggregate with no sub-device has no clock, and a device with no
+        // clock never runs its IOProc — the tap would exist and deliver
+        // nothing. The default output provides one, and being the main
+        // sub-device is what makes it the timebase.
+        let output_uid = default_output_uid()?;
+        let sub_device: Retained<NSDictionary<NSString, AnyObject>> =
+            NSDictionary::from_retained_objects(
+                &[&*key(kAudioSubDeviceUIDKey)],
+                &[Retained::into_super(NSString::from_str(&output_uid)).into()],
+            );
+
         let keys = [
             key(kAudioAggregateDeviceNameKey),
             key(kAudioAggregateDeviceUIDKey),
             key(kAudioAggregateDeviceIsPrivateKey),
             key(kAudioAggregateDeviceTapAutoStartKey),
             key(kAudioAggregateDeviceTapListKey),
+            key(kAudioAggregateDeviceSubDeviceListKey),
             key(kAudioAggregateDeviceMainSubDeviceKey),
         ];
-        let values: [Retained<AnyObject>; 6] = [
+        let values: [Retained<AnyObject>; 7] = [
             Retained::into_super(NSString::from_str("output-decibel-meter tap")).into(),
             Retained::into_super(NSUUID::new().UUIDString()).into(),
             Retained::into_super(NSNumber::new_bool(true)).into(),
             Retained::into_super(NSNumber::new_bool(true)).into(),
             Retained::into_super(NSArray::from_retained_slice(&[sub_tap])).into(),
-            Retained::into_super(NSString::from_str("")).into(),
+            Retained::into_super(NSArray::from_retained_slice(&[sub_device])).into(),
+            Retained::into_super(NSString::from_str(&output_uid)).into(),
         ];
         let description: Retained<NSDictionary<NSString, AnyObject>> =
             NSDictionary::from_retained_objects(&keys.each_ref().map(|k| &**k), &values);
@@ -208,6 +223,54 @@ unsafe fn aggregate_around(tap_uid: &NSString) -> Result<AudioObjectID> {
             bail!("Core Audio would not wrap the tap in a device: status {status}");
         }
         Ok(aggregate)
+    }
+}
+
+/// The unique id of the output the system plays through.
+///
+/// Wanted for the aggregate's timebase rather than for the audio: a tap follows
+/// what is played, whatever device it was going to.
+unsafe fn default_output_uid() -> Result<String> {
+    const SYSTEM: AudioObjectID = 1;
+    unsafe {
+        let address = AudioObjectPropertyAddress {
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut device: AudioObjectID = 0;
+        let mut size = std::mem::size_of_val(&device) as u32;
+        let status = AudioObjectGetPropertyData(
+            SYSTEM,
+            NonNull::from(&address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut device).cast::<c_void>(),
+        );
+        if status != 0 || device == 0 {
+            bail!("this Mac reports no default output to clock a tap against (status {status})");
+        }
+
+        let address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut uid: *const objc2_core_foundation::CFString = std::ptr::null();
+        let mut size = std::mem::size_of_val(&uid) as u32;
+        let status = AudioObjectGetPropertyData(
+            device,
+            NonNull::from(&address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut uid).cast::<c_void>(),
+        );
+        if status != 0 || uid.is_null() {
+            bail!("the default output would not say what it is called (status {status})");
+        }
+        Ok((*uid).to_string())
     }
 }
 

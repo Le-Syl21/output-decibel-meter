@@ -26,8 +26,9 @@ fn a_tone_of_a_known_level_reads_back_at_that_level() {
         selftest::Outcome::Ran(report) => report,
         // A machine with no audio says nothing about the code, and failing here
         // would only ever mean "this is not a machine to run this on".
-        selftest::Outcome::NothingToPlayInto(why) => {
-            eprintln!("nothing to play into here, so nothing was checked: {why}");
+        selftest::Outcome::NothingToPlayInto(why)
+        | selftest::Outcome::NothingToCaptureWith(why) => {
+            eprintln!("nothing was checked on this machine: {why}");
             return;
         }
     };

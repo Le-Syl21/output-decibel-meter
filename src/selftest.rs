@@ -74,6 +74,8 @@ pub enum Outcome {
     Ran(Report),
     /// There was nothing to play into, with what the system said about it.
     NothingToPlayInto(String),
+    /// The tone played, but nothing here can capture it back.
+    NothingToCaptureWith(String),
 }
 
 /// What the check ran against, which decides what it proves.
@@ -108,6 +110,13 @@ pub fn run() -> Result<Outcome> {
         Err(Silence::Failed(e)) => return Err(e),
     };
     let source = ours_or_the_output()?;
+    if source.is_output && !capture::outputs_can_be_captured() {
+        return Ok(Outcome::NothingToCaptureWith(format!(
+            "the tone is playing on {}, but {}",
+            source.name,
+            capture::WHY_NOT_OUTPUTS
+        )));
+    }
     let mode = source.mode;
     let name = source.name.clone();
     let (loud, channels) = measure(&source)?;

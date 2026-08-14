@@ -118,6 +118,13 @@ fn self_test() -> Result<()> {
 
     let report = match selftest::run()? {
         selftest::Outcome::Ran(report) => report,
+        selftest::Outcome::NothingToCaptureWith(why) => {
+            println!("{why}");
+            println!();
+            println!("nothing was measured, which says nothing about the meter itself.");
+            println!("run --diagnose for what the audio stack does expose here.");
+            std::process::exit(2);
+        }
         selftest::Outcome::NothingToPlayInto(why) => {
             println!("no audio output on this machine: {why}");
             println!();

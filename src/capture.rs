@@ -422,6 +422,22 @@ fn listed() -> Vec<SourceInfo> {
         .unwrap_or_default()
 }
 
+/// Whether an output can be captured on this platform at all.
+///
+/// Capturing an output means recording what it plays, and no platform does that
+/// through the same call. Linux gets away with opening one because a sink's
+/// monitor is an ordinary input; Windows wants WASAPI's loopback flag and macOS
+/// a Core Audio process tap, and `cpal` exposes neither. Asked anyway, macOS
+/// answers `Unknown property` from three layers down, which explains nothing.
+pub fn outputs_can_be_captured() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// What to say when they cannot.
+pub const WHY_NOT_OUTPUTS: &str = "capturing an output is not implemented on this platform yet — \
+     it needs WASAPI loopback on Windows and a Core Audio process tap on macOS, \
+     neither of which cpal exposes";
+
 /// Find a source whose name contains `fragment`, case-insensitively.
 pub fn find(fragment: &str) -> Result<Source> {
     let wanted = fragment.to_lowercase();
@@ -488,19 +504,8 @@ impl Source {
             }
         };
 
-        // Capturing an output means recording what it plays, which no platform
-        // does through the same call. Linux exposes a sink's monitor as an
-        // ordinary input, so opening it works; Windows wants WASAPI's loopback
-        // flag and macOS a process tap, and `cpal` offers neither. Saying so
-        // beats the "Unknown property" the OS answers when asked anyway.
-        if self.is_output && device.default_input_config().is_err() {
-            bail!(
-                "{} is an output, and capturing one is not implemented on {} yet: \
-                 it needs WASAPI loopback on Windows and a Core Audio process tap \
-                 on macOS, neither of which cpal exposes",
-                self.name,
-                std::env::consts::OS
-            );
+        if self.is_output && !outputs_can_be_captured() {
+            bail!("{}: {}", self.name, WHY_NOT_OUTPUTS);
         }
 
         let supported = if self.is_output {

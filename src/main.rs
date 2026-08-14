@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::Parser;
+use cpal::traits::{DeviceTrait, HostTrait};
 use output_decibel_meter::capture::{self, CaptureMode, Source};
 use output_decibel_meter::meter::Meter;
 use output_decibel_meter::selftest;
@@ -29,10 +30,18 @@ struct Cli {
     /// figures match. Meters this process, so nothing else has to stop.
     #[arg(long)]
     self_test: bool,
+    /// Print everything this machine exposes of its audio stack, and what this
+    /// tool makes of it. For working out where a problem sits.
+    #[arg(long)]
+    diagnose: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.diagnose {
+        return diagnose();
+    }
 
     if cli.self_test {
         return self_test();
@@ -100,8 +109,24 @@ fn tag(source: &Source) -> &'static str {
 }
 
 /// Play a tone, meter it back, and say whether the chain holds up.
+///
+/// Three outcomes, and they mean different things, so they exit differently:
+/// the figures matched (0), the figures were wrong (1), or this machine has
+/// nothing to play into (2). Only the middle one says anything about the code.
 fn self_test() -> Result<()> {
-    let report = selftest::run()?;
+    describe_machine();
+
+    let report = match selftest::run()? {
+        selftest::Outcome::Ran(report) => report,
+        selftest::Outcome::NothingToPlayInto(why) => {
+            println!("no audio output on this machine: {why}");
+            println!();
+            println!("nothing was measured, which says nothing about the meter itself.");
+            println!("run --diagnose for what the audio stack does expose here.");
+            std::process::exit(2);
+        }
+    };
+
     println!("metering {}", report.source);
     println!(
         "  {}",
@@ -111,6 +136,7 @@ fn self_test() -> Result<()> {
             CaptureMode::Device => "an output in loopback — nothing else must be playing",
         }
     );
+    println!("  {} channels", report.channels);
     println!();
 
     for check in &report.checks {
@@ -131,9 +157,132 @@ fn self_test() -> Result<()> {
         return Ok(());
     }
     if report.needs_a_quiet_machine {
-        println!("this ran on an output, so anything else playing would land in the same figures");
+        println!("this ran on an output rather than on this process's own stream,");
+        println!("so anything else the machine was playing landed in the same figures.");
     }
-    bail!("self-test failed")
+    bail!("self-test failed: the tone did not come back at the level it was played")
+}
+
+/// Everything about this machine's audio, printed rather than interpreted.
+///
+/// Meant for a machine nobody can log into — a CI runner, someone else's
+/// desktop — where the first question is always the same: is the audio stack
+/// there at all? Every step says what it found and what it could not, so a
+/// failure can be pinned on the system or on this program without guessing.
+fn diagnose() -> Result<()> {
+    describe_machine();
+
+    println!("cpal");
+    let host = cpal::default_host();
+    println!("  host: {:?}", host.id());
+    match host.default_output_device() {
+        Some(device) => println!("  default output: {}", describe_device(&device)),
+        None => println!("  default output: none"),
+    }
+    match host.default_input_device() {
+        Some(device) => println!("  default input:  {}", describe_device(&device)),
+        None => println!("  default input:  none"),
+    }
+    report_devices("output devices", host.output_devices().map(|d| d.collect()));
+    report_devices("input devices", host.input_devices().map(|d| d.collect()));
+    println!();
+
+    #[cfg(all(target_os = "linux", feature = "pipewire"))]
+    {
+        println!("PipeWire graph");
+        match output_decibel_meter::graph::nodes() {
+            Ok(nodes) => {
+                println!("  {} nodes", nodes.len());
+                for node in nodes {
+                    println!(
+                        "    {:<8} {:<7} pid {:<8} serial {:<7} {}",
+                        format!("{:?}", node.kind),
+                        if node.is_active { "active" } else { "idle" },
+                        node.pid.map(|p| p.to_string()).unwrap_or("—".to_string()),
+                        node.serial,
+                        node.name
+                    );
+                }
+            }
+            Err(e) => println!("  unavailable: {e:#}"),
+        }
+        println!();
+    }
+
+    println!("what this tool would meter");
+    match capture::sources() {
+        Ok(sources) if sources.is_empty() => println!("  nothing"),
+        Ok(sources) => {
+            for source in &sources {
+                println!("  {} {:<8} {}", tag(source), state(source), source.name);
+            }
+        }
+        Err(e) => println!("  listing failed: {e:#}"),
+    }
+    match capture::default_output() {
+        Ok(source) => println!("  default: {}", source.name),
+        Err(e) => println!("  no default output: {e:#}"),
+    }
+    Ok(())
+}
+
+/// The lines that head both reports: what this is running on.
+fn describe_machine() {
+    println!(
+        "output-decibel-meter {} on {} {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    let backend = if cfg!(all(target_os = "linux", feature = "pipewire")) {
+        "PipeWire graph, with cpal as the fallback"
+    } else {
+        "cpal only"
+    };
+    println!("  backend: {backend}");
+    for name in [
+        "XDG_RUNTIME_DIR",
+        "PIPEWIRE_REMOTE",
+        "PULSE_SERVER",
+        "DISPLAY",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            println!("  {name}={}", value.to_string_lossy());
+        }
+    }
+    println!();
+}
+
+/// One device, with the configuration it would be opened at.
+fn describe_device(device: &cpal::Device) -> String {
+    let name = device
+        .description()
+        .map(|d| d.to_string())
+        .unwrap_or_else(|e| format!("<unnamed: {e}>"));
+    let config = match device.default_output_config() {
+        Ok(config) => format!(
+            "{} ch, {} Hz, {}",
+            config.channels(),
+            config.sample_rate(),
+            config.sample_format()
+        ),
+        Err(e) => format!("no default output config: {e}"),
+    };
+    format!("{name} [{config}]")
+}
+
+/// A whole list of devices, or why there is none.
+fn report_devices(what: &str, devices: std::result::Result<Vec<cpal::Device>, cpal::Error>) {
+    match devices {
+        Ok(devices) if devices.is_empty() => println!("  {what}: none"),
+        Ok(devices) => {
+            println!("  {what}: {}", devices.len());
+            for device in &devices {
+                println!("    {}", describe_device(device));
+            }
+        }
+        Err(e) => println!("  {what}: cannot be listed: {e}"),
+    }
 }
 
 /// Whether audio flows through it, this meter's own tap excluded, or a dash

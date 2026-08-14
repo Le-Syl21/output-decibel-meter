@@ -63,6 +63,19 @@ impl Check {
     }
 }
 
+/// What came of trying to check this machine.
+///
+/// The two are worth telling apart: a machine with no audio at all says nothing
+/// about the code, while a tone that comes back at the wrong level says a great
+/// deal. Callers report them differently, and so does the exit status.
+#[derive(Debug, Clone)]
+pub enum Outcome {
+    /// The tone played and was metered; the report says how it went.
+    Ran(Report),
+    /// There was nothing to play into, with what the system said about it.
+    NothingToPlayInto(String),
+}
+
 /// What the check ran against, which decides what it proves.
 #[derive(Debug, Clone)]
 pub struct Report {
@@ -72,6 +85,8 @@ pub struct Report {
     pub mode: CaptureMode,
     /// Set when the machine had to be quiet for the figures to mean anything.
     pub needs_a_quiet_machine: bool,
+    /// Channel count the metered stream came in at.
+    pub channels: u32,
     /// Everything that was checked.
     pub checks: Vec<Check>,
 }
@@ -84,10 +99,14 @@ impl Report {
 }
 
 /// Play a tone, meter it back, and report what came out.
-pub fn run() -> Result<Report> {
+pub fn run() -> Result<Outcome> {
     // The loud tone first, and the source is found while it plays: a program
     // only exists in the graph for as long as it has a stream open.
-    let tone = Tone::start(REFERENCE_DBFS)?;
+    let tone = match Tone::start(REFERENCE_DBFS) {
+        Ok(tone) => tone,
+        Err(Silence::NoOutput(why)) => return Ok(Outcome::NothingToPlayInto(why)),
+        Err(Silence::Failed(e)) => return Err(e),
+    };
     let source = ours_or_the_output()?;
     let mode = source.mode;
     let name = source.name.clone();
@@ -119,7 +138,7 @@ pub fn run() -> Result<Report> {
     // Then the same tone six decibels down. This one is a difference, so it
     // holds whatever the path does to the absolute level — a system volume in
     // the way, a monitor that carries it, a resampler.
-    let tone = Tone::start(REFERENCE_DBFS - STEP_DB)?;
+    let tone = Tone::start(REFERENCE_DBFS - STEP_DB).map_err(Silence::into_error)?;
     let source = ours_or_the_output()?;
     let (quiet, _) = measure(&source)?;
     drop(tone);
@@ -132,12 +151,30 @@ pub fn run() -> Result<Report> {
         unit: "dB",
     });
 
-    Ok(Report {
+    Ok(Outcome::Ran(Report {
         source: name,
         needs_a_quiet_machine: mode != CaptureMode::Application,
         mode,
+        channels,
         checks,
-    })
+    }))
+}
+
+/// Why no tone could be played.
+enum Silence {
+    /// This machine has no output, which is about the machine, not the code.
+    NoOutput(String),
+    /// Something else went wrong, which is about the code.
+    Failed(anyhow::Error),
+}
+
+impl Silence {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Silence::NoOutput(why) => anyhow::anyhow!(why),
+            Silence::Failed(e) => e,
+        }
+    }
 }
 
 /// This process's own stream, or the output it is playing into.
@@ -177,13 +214,26 @@ struct Tone {
 
 impl Tone {
     /// Start playing at `peak_dbfs`, and wait for the server to route it.
-    fn start(peak_dbfs: f64) -> Result<Self> {
-        let device = cpal::default_host()
-            .default_output_device()
-            .context("this machine reports no default output to play into")?;
-        let supported = device
-            .default_output_config()
-            .context("the default output reports no usable configuration")?;
+    fn start(peak_dbfs: f64) -> std::result::Result<Self, Silence> {
+        let host = cpal::default_host();
+        let Some(device) = host.default_output_device() else {
+            return Err(Silence::NoOutput(format!(
+                "the {:?} host reports no default output device",
+                host.id()
+            )));
+        };
+        let named = device
+            .description()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|_| "unnamed".to_string());
+        let supported = match device.default_output_config() {
+            Ok(supported) => supported,
+            Err(e) => {
+                return Err(Silence::NoOutput(format!(
+                    "{named} reports no usable output configuration: {e}"
+                )));
+            }
+        };
         let config: cpal::StreamConfig = supported.config();
         let channels = config.channels as usize;
         let rate = config.sample_rate as f64;
@@ -208,8 +258,11 @@ impl Tone {
                 |e| eprintln!("the tone stopped: {e}"),
                 None,
             )
-            .context("opening the default output to play the tone")?;
-        stream.play().context("starting the tone")?;
+            .map_err(|e| Silence::NoOutput(format!("{named} would not open for playback: {e}")));
+        let stream = stream?;
+        stream
+            .play()
+            .map_err(|e| Silence::Failed(anyhow::anyhow!("starting the tone on {named}: {e}")))?;
         // The stream has to reach the graph before anything can look for it.
         std::thread::sleep(Duration::from_millis(600));
         Ok(Self { _stream: stream })

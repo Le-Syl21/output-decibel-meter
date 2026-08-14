@@ -11,6 +11,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # These runs are the only look anyone gets at Windows and macOS, so a panic
+  # has to arrive with its stack rather than with a line number.
+  RUST_BACKTRACE: 1
 
 jobs:
   lint:
@@ -173,15 +176,60 @@ jobs:
         if: matrix.target != 'x86_64-apple-darwin'
         run: cargo test --release --target ${{ matrix.target }}
 
-      # Windows and macOS runners ship no audio endpoint at all, so this is
-      # expected to report that there is nothing to play into. It runs anyway,
-      # and does not fail the build, because the day a runner does have one the
-      # answer is worth having — and because "no default output" is itself a
-      # path worth exercising outside Linux.
+      # Nobody here has a Windows or a macOS machine, so these runs are the
+      # sandbox. None of the steps below may fail the build: what they are for
+      # is telling a problem in this program apart from a runner that simply has
+      # no sound card, and that answer is worth having either way.
+
+      # macOS can be given a real device: BlackHole is a virtual card, so the
+      # tone check has somewhere to play and something to capture.
+      - name: Install a virtual audio device (macOS, informative)
+        if: matrix.target == 'aarch64-apple-darwin'
+        continue-on-error: true
+        run: |
+          brew install --cask blackhole-2ch
+          brew install switchaudio-osx
+          sleep 5
+          SwitchAudioSource -a -t output
+          SwitchAudioSource -s "BlackHole 2ch" -t output || true
+          SwitchAudioSource -c -t output
+
+      - name: What the system says it has (informative)
+        if: matrix.target != 'x86_64-apple-darwin'
+        continue-on-error: true
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Windows)
+              powershell -Command "Get-Service Audiosrv | Format-List Name,Status,StartType"
+              powershell -Command "Get-CimInstance Win32_SoundDevice | Format-List Name,Status,StatusInfo"
+              ;;
+            macOS)  system_profiler SPAudioDataType ;;
+            Linux)  wpctl status || aplay -l || true ;;
+          esac
+
+      - name: What this tool makes of it (informative)
+        if: matrix.target != 'x86_64-apple-darwin'
+        continue-on-error: true
+        run: cargo run --release --target ${{ matrix.target }} -- --diagnose
+
+      # Exit 2 means this machine has no audio, which says nothing about the
+      # code; exit 1 would mean the tone came back wrong, which says everything.
       - name: Try the tone check (informative)
         if: runner.os != 'Linux' && matrix.target != 'x86_64-apple-darwin'
         continue-on-error: true
-        run: cargo run --release --target ${{ matrix.target }} -- --self-test
+        shell: bash
+        run: |
+          set +e
+          cargo run --release --target ${{ matrix.target }} -- --self-test
+          status=$?
+          set -e
+          case $status in
+            0) echo "::notice::the tone check passed on ${{ matrix.label }}" ;;
+            2) echo "::notice::${{ matrix.label }} has no audio output; nothing was measured" ;;
+            *) echo "::warning::the tone check failed on ${{ matrix.label }} with status $status — \
+                     this one is about the code, not the runner" ;;
+          esac
 
       - name: Package (Unix)
         if: runner.os != 'Windows'

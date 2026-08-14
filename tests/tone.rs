@@ -22,7 +22,15 @@ use output_decibel_meter::selftest;
 #[test]
 #[ignore = "plays a tone through the audio server; run with --ignored"]
 fn a_tone_of_a_known_level_reads_back_at_that_level() {
-    let report = selftest::run().expect("playing and metering a tone");
+    let report = match selftest::run().expect("playing and metering a tone") {
+        selftest::Outcome::Ran(report) => report,
+        // A machine with no audio says nothing about the code, and failing here
+        // would only ever mean "this is not a machine to run this on".
+        selftest::Outcome::NothingToPlayInto(why) => {
+            eprintln!("nothing to play into here, so nothing was checked: {why}");
+            return;
+        }
+    };
     for check in &report.checks {
         assert!(
             check.passed(),

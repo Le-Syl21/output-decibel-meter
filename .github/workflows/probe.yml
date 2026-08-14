@@ -36,3 +36,8 @@ jobs:
       - name: The tone check
         continue-on-error: true
         run: cargo run --release -- --self-test
+
+      # The other tap: everything the machine plays, rather than one process.
+      - name: The global tap
+        continue-on-error: true
+        run: cargo run --release -- --source "Everything" --seconds 3

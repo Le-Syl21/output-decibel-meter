@@ -12,6 +12,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use anyhow::{Result, bail};
@@ -34,6 +35,25 @@ use objc2_core_audio::{
 use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp};
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSUUID};
+
+/// What the callback has been handed, counted.
+///
+/// A tap that delivers nothing has two very different causes — an IOProc that
+/// never runs, and one that runs on empty buffers — and from the outside they
+/// look identical. These tell them apart.
+static CALLS: AtomicU64 = AtomicU64::new(0);
+static BUFFERS: AtomicU64 = AtomicU64::new(0);
+static SAMPLES: AtomicU64 = AtomicU64::new(0);
+
+/// How often the callback ran, how many buffers it saw, how many samples those
+/// held. All since the process started.
+pub fn delivery() -> (u64, u64, u64) {
+    (
+        CALLS.load(Ordering::Relaxed),
+        BUFFERS.load(Ordering::Relaxed),
+        SAMPLES.load(Ordering::Relaxed),
+    )
+}
 
 /// What a tap should listen to.
 #[derive(Debug, Clone, Copy)]
@@ -356,9 +376,11 @@ unsafe extern "C-unwind" fn deliver(
         if context.is_null() {
             return 0;
         }
+        CALLS.fetch_add(1, Ordering::Relaxed);
         let sender = &*(context as *const Sender<Vec<f32>>);
         let list = input.as_ref();
         let count = list.mNumberBuffers as usize;
+        BUFFERS.fetch_add(count as u64, Ordering::Relaxed);
         let buffers = std::slice::from_raw_parts(list.mBuffers.as_ptr(), count);
 
         for buffer in buffers {
@@ -366,6 +388,7 @@ unsafe extern "C-unwind" fn deliver(
                 continue;
             }
             let samples = buffer.mDataByteSize as usize / std::mem::size_of::<f32>();
+            SAMPLES.fetch_add(samples as u64, Ordering::Relaxed);
             let block = std::slice::from_raw_parts(buffer.mData as *const f32, samples).to_vec();
             if !block.is_empty() {
                 let _ = sender.send(block);

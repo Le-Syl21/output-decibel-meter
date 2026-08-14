@@ -116,7 +116,11 @@ fn tag(source: &Source) -> &'static str {
 fn self_test() -> Result<()> {
     describe_machine();
 
-    let report = match selftest::run()? {
+    let outcome = selftest::run();
+    if outcome.is_err() {
+        report_delivery();
+    }
+    let report = match outcome? {
         selftest::Outcome::Ran(report) => report,
         selftest::Outcome::NothingToCaptureWith(why) => {
             println!("{why}");
@@ -163,11 +167,22 @@ fn self_test() -> Result<()> {
         println!("self-test passed");
         return Ok(());
     }
+    report_delivery();
     if report.needs_a_quiet_machine {
         println!("this ran on an output rather than on this process's own stream,");
         println!("so anything else the machine was playing landed in the same figures.");
     }
     bail!("self-test failed: the tone did not come back at the level it was played")
+}
+
+/// On macOS, what the tap callback actually saw. Silence has two causes there
+/// and they are told apart by whether anything was handed over at all.
+fn report_delivery() {
+    #[cfg(target_os = "macos")]
+    {
+        let (calls, buffers, samples) = output_decibel_meter::coreaudio::delivery();
+        println!("the tap callback ran {calls} times, over {buffers} buffers, {samples} samples");
+    }
 }
 
 /// Everything about this machine's audio, printed rather than interpreted.

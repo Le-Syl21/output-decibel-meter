@@ -171,7 +171,7 @@ unsafe fn aggregate_around(tap_uid: &NSString) -> Result<AudioObjectID> {
         let sub_tap: Retained<NSDictionary<NSString, AnyObject>> =
             NSDictionary::from_retained_objects(
                 &[&*key(kAudioSubTapUIDKey)],
-                &[Retained::into_super(tap_uid.copy())],
+                &[Retained::into_super(NSString::from_str(&tap_uid.to_string())).into()],
             );
 
         let keys = [
@@ -183,12 +183,12 @@ unsafe fn aggregate_around(tap_uid: &NSString) -> Result<AudioObjectID> {
             key(kAudioAggregateDeviceMainSubDeviceKey),
         ];
         let values: [Retained<AnyObject>; 6] = [
-            Retained::into_super(NSString::from_str("output-decibel-meter tap")),
-            Retained::into_super(NSUUID::new().UUIDString()),
-            Retained::into_super(NSNumber::new_bool(true)),
-            Retained::into_super(NSNumber::new_bool(true)),
-            Retained::into_super(NSArray::from_retained_slice(&[sub_tap])),
-            Retained::into_super(NSString::from_str("")),
+            Retained::into_super(NSString::from_str("output-decibel-meter tap")).into(),
+            Retained::into_super(NSUUID::new().UUIDString()).into(),
+            Retained::into_super(NSNumber::new_bool(true)).into(),
+            Retained::into_super(NSNumber::new_bool(true)).into(),
+            Retained::into_super(NSArray::from_retained_slice(&[sub_tap])).into(),
+            Retained::into_super(NSString::from_str("")).into(),
         ];
         let description: Retained<NSDictionary<NSString, AnyObject>> =
             NSDictionary::from_retained_objects(&keys.each_ref().map(|k| &**k), &values);

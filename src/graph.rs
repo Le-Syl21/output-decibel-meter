@@ -737,10 +737,8 @@ fn run(
             let Some(bytes) = data.data() else { return };
             let start = offset.min(bytes.len());
             let end = start.saturating_add(size).min(bytes.len());
-            let samples: Vec<f32> = bytes[start..end]
-                .chunks_exact(std::mem::size_of::<f32>())
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
+            let (words, _) = bytes[start..end].as_chunks::<{ size_of::<f32>() }>();
+            let samples: Vec<f32> = words.iter().copied().map(f32::from_le_bytes).collect();
             if !samples.is_empty() {
                 let _ = state.blocks.send(samples);
             }

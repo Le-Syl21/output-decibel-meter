@@ -43,7 +43,7 @@ jobs:
           fi
           echo "tag $GITHUB_REF_NAME matches Cargo.toml $crate"
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
       # ALSA for cpal, GTK for the file dialogs eframe pulls in, PipeWire for
       # per-program capture — with clang, which its bindings generate through.
@@ -89,7 +89,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
       - name: Install PipeWire and the build dependencies
         run: |
@@ -162,7 +162,7 @@ jobs:
           # Needed for the macOS x86_64 cross build: the runner is arm64.
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
       - name: Install audio and GUI dependencies (Linux)
         if: runner.os == 'Linux'

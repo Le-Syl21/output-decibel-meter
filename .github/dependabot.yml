@@ -1,0 +1,39 @@
+version: 2
+
+# Third-party actions are pinned to a SHA: a version tag is mutable — in March
+# 2026, 76 of trivy-action's 77 tags were force-pushed to malicious code — and
+# only a SHA is immutable. The price is that fixes no longer arrive on their
+# own, which is what Dependabot is here for: it knows how to move a pinned SHA
+# and keep the version comment next to it in sync.
+#
+# Pin the SHA of a *release*, never of a branch head. With no tag to anchor on,
+# Dependabot has nothing to compare against and simply follows the default
+# branch — which is how rust-cache silently drifted 50 commits onto master
+# across the other repos before it was caught.
+updates:
+  # One grouped PR a month rather than one per dependency.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      crates:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+    ignore:
+      # dtolnay/rust-toolchain has no "versions": the ref names the Rust
+      # toolchain to install (here the `stable` channel), not a release of the
+      # action. Dependabot reads such a ref as a version number and proposes
+      # nonsense bumps; the toolchain we want is chosen by the ref itself.
+      - dependency-name: dtolnay/rust-toolchain
